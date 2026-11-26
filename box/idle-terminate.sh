@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Runs as root every 5 minutes (llmchat-idle.timer). Terminates this Lambda instance once vLLM has had no requests for
+# Runs as root every 5 minutes (lambdachat-idle.timer). Terminates this Lambda instance once vLLM has had no requests for
 # IDLE_MIN minutes. "Activity" means vLLM's finished-request counter changed, or a request is running or queued.
-# If vLLM is down, the box counts as idle too. `touch /var/lib/llmchat/keep` (llmchat keepalive on) disables it.
+# If vLLM is down, the box counts as idle too. `touch /var/lib/lambdachat/keep` (lambdachat keepalive on) disables it.
 set -u
-. /etc/llmchat/idle.env  # INSTANCE_ID, IDLE_MIN
-S=/var/lib/llmchat
+. /etc/lambdachat/idle.env  # INSTANCE_ID, IDLE_MIN
+S=/var/lib/lambdachat
 now=$(date +%s)
 [ -s "$S/last_active" ] || echo "$now" >"$S/last_active"
 
@@ -24,5 +24,5 @@ echo "idle ${idle_min}/${IDLE_MIN} min (requests done: $done_total, in flight: $
 
 echo "idle for $idle_min min: terminating instance $INSTANCE_ID"
 curl -fsS -m 60 -X POST https://cloud.lambda.com/api/v1/instance-operations/terminate \
-  -H "Authorization: Bearer $(cat /etc/llmchat/lambda-api-key)" -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $(cat /etc/lambdachat/lambda-api-key)" -H "Content-Type: application/json" \
   -A lambda-vllm-chat -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}"

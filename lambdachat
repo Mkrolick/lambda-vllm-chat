@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""llmchat: serve a Hugging Face model with vLLM on a Lambda Cloud GPU box and chat with it from this machine.
+"""lambdachat: serve a Hugging Face model with vLLM on a Lambda Cloud GPU box and chat with it from this machine.
 
-  llmchat up                 launch a box (cheapest that fits) and serve the model; reuses a running box
-  llmchat ui                 Open WebUI in the browser (local, http://localhost:13000); runs `up` first if needed
-  llmchat chat               terminal chat; every conversation is saved as JSON
-  llmchat api [--env]        open the tunnel and print the OpenAI-compatible endpoint for scripts and eval harnesses
-  llmchat status             box, model, cost so far, idle timer, tunnel and UI
-  llmchat keepalive on|off   pause or resume the box's idle auto-terminate
-  llmchat logs               follow the vLLM log on the box
-  llmchat ssh [cmd...]       shell on the box
-  llmchat down               terminate the box and stop the tunnel and local UI
-  llmchat adopt ID           manage an instance launched some other way (then run `llmchat up` to provision it)
+  lambdachat up                 launch a box (cheapest that fits) and serve the model; reuses a running box
+  lambdachat ui                 Open WebUI in the browser (local, http://localhost:13000); runs `up` first if needed
+  lambdachat chat               terminal chat; every conversation is saved as JSON
+  lambdachat api [--env]        open the tunnel and print the OpenAI-compatible endpoint for scripts and eval harnesses
+  lambdachat status             box, model, cost so far, idle timer, tunnel and UI
+  lambdachat keepalive on|off   pause or resume the box's idle auto-terminate
+  lambdachat logs               follow the vLLM log on the box
+  lambdachat ssh [cmd...]       shell on the box
+  lambdachat down               terminate the box and stop the tunnel and local UI
+  lambdachat adopt ID           manage an instance launched some other way (then run `lambdachat up` to provision it)
 
 Settings live in config.env next to this script; override them in ~/.config/lambda-vllm-chat/config.env or with
-LLMCHAT_<KEY>=value. The Lambda API key comes from $LAMBDA_API_KEY or ~/.config/lambda/api-key.
+LAMBDACHAT_<KEY>=value. The Lambda API key comes from $LAMBDA_API_KEY or ~/.config/lambda/api-key.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(os.path.realpath(__file__)).parent
-STATE_DIR = Path(os.environ.get("LLMCHAT_STATE_DIR", "~/.config/lambda-vllm-chat")).expanduser()
+STATE_DIR = Path(os.environ.get("LAMBDACHAT_STATE_DIR", "~/.config/lambda-vllm-chat")).expanduser()
 STATE_FILE = STATE_DIR / "state.json"
 TUNNEL_SOCK = STATE_DIR / "tunnel.sock"
 WEBUI_PID = STATE_DIR / "webui.pid"
@@ -72,13 +72,13 @@ def parse_time(s: str) -> dt.datetime:
 
 @contextlib.contextmanager
 def lock(name: str):
-    """Exclusive lock shared by every llmchat process using this state dir (two `up`s must not launch two boxes)."""
+    """Exclusive lock shared by every lambdachat process using this state dir (two `up`s must not launch two boxes)."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     with open(STATE_DIR / f"{name}.lock", "w") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            print(f"(waiting for another llmchat command to finish: {name})", file=sys.stderr)
+            print(f"(waiting for another lambdachat command to finish: {name})", file=sys.stderr)
             fcntl.flock(f, fcntl.LOCK_EX)
         yield
 
@@ -96,8 +96,8 @@ def load_config() -> dict:
                     k, v = line.split("=", 1)
                     cfg[k.strip()] = v.strip()
     for k, v in os.environ.items():
-        if k.startswith("LLMCHAT_") and k != "LLMCHAT_STATE_DIR":
-            cfg[k[len("LLMCHAT_"):]] = v
+        if k.startswith("LAMBDACHAT_") and k != "LAMBDACHAT_STATE_DIR":
+            cfg[k[len("LAMBDACHAT_"):]] = v
     cfg["SERVED_NAME"] = cfg.get("SERVED_NAME") or cfg["MODEL_REPO"].split("/")[-1].lower()
     cfg["DATA_DIR"] = str(Path(cfg.get("DATA_DIR") or "~/LLM-Chat").expanduser())
     for k in ("API_PORT", "UI_PORT", "IDLE_MIN", "MIN_VRAM_GB", "MAX_GPUS"):
@@ -120,7 +120,7 @@ def need_box() -> dict:
     """The recorded box, for commands that must not launch one."""
     state = load_state()
     if not state or not state.get("ip"):
-        die("no box is running (`llmchat up` starts one)")
+        die("no box is running (`lambdachat up` starts one)")
     return state
 
 
@@ -210,7 +210,7 @@ def ssh_key_name(cfg: dict) -> str:
         for k in remote:
             if k["public_key"].split()[:2] == local:
                 return k["name"]
-    name = f"llmchat-{socket.gethostname().split('.')[0]}"
+    name = f"lambdachat-{socket.gethostname().split('.')[0]}"
     lam("POST", "/ssh-keys", {"name": name, "public_key": pubs[0].read_text().strip()})
     print(f"Added {pubs[0]} to Lambda as SSH key '{name}'")
     return name
@@ -221,8 +221,8 @@ def launch(cfg: dict) -> dict:
     a unique name, and after any error the instance list is searched for it so a box that did start is never orphaned."""
     itype, region, price, gpus = choose_type(cfg)
     key = ssh_key_name(cfg)
-    name = f"llmchat-{cfg['SERVED_NAME'][:44]}-{os.urandom(3).hex()}"
-    print(f"Launching {BOLD}{itype}{RESET} in {region} at {BOLD}${price / 100:.2f}/hr{RESET} (billed until llmchat down"
+    name = f"lambdachat-{cfg['SERVED_NAME'][:44]}-{os.urandom(3).hex()}"
+    print(f"Launching {BOLD}{itype}{RESET} in {region} at {BOLD}${price / 100:.2f}/hr{RESET} (billed until lambdachat down"
           + (f" or {cfg['IDLE_MIN']} idle min" if cfg["IDLE_MIN"] else "") + ")", flush=True)
     body = {"region_name": region, "instance_type_name": itype, "ssh_key_names": [key], "name": name}
     iid, failure = None, None
@@ -248,7 +248,7 @@ def launch(cfg: dict) -> dict:
             time.sleep(10)
         else:
             die(f"no instance named {name} appeared, so the launch most likely failed. If one shows up in the Lambda "
-                f"console later, take it over with `llmchat adopt <id>` or terminate it there.")
+                f"console later, take it over with `lambdachat adopt <id>` or terminate it there.")
     state = {"instance_id": iid, "instance_name": name, "instance_type": itype, "region": region,
              "price_cents_per_hour": price, "gpus": gpus, "launched_at": now_iso(), "model_repo": cfg["MODEL_REPO"],
              "model_revision": cfg["MODEL_REVISION"], "served_name": cfg["SERVED_NAME"], "ready": False}
@@ -269,7 +269,7 @@ def wait_active(state: dict) -> dict:
         if time.time() - t0 > 1200:
             terminate(state["instance_id"])
             STATE_FILE.unlink(missing_ok=True)
-            die("instance did not become active within 20 min, so it was terminated; try `llmchat up` again")
+            die("instance did not become active within 20 min, so it was terminated; try `lambdachat up` again")
         if not dots:
             print(f"Instance {state['instance_id']}; waiting for it to boot (usually 2-5 min) ...", end="", flush=True)
             dots = True
@@ -302,7 +302,7 @@ def ssh(state: dict, cmd: str, **kw) -> subprocess.CompletedProcess:
 
 def touch_idle(state: dict) -> None:
     """Count starting a session as activity, so the box can't idle out seconds after you attach."""
-    ssh(state, "test -d /var/lib/llmchat && date +%s | sudo tee /var/lib/llmchat/last_active >/dev/null",
+    ssh(state, "test -d /var/lib/lambdachat && date +%s | sudo tee /var/lib/lambdachat/last_active >/dev/null",
         capture_output=True)
 
 
@@ -531,7 +531,7 @@ def still_billing(state: dict, watchdog: bool) -> str:
     note = (f"it terminates itself after {state.get('idle_min', '?')} idle min" if watchdog
             else "it has no idle auto-terminate yet")
     return (f"The box {state['instance_id']} is still running at ${state['price_cents_per_hour'] / 100:.2f}/hr ({note}). "
-            "`llmchat up` retries, `llmchat down` terminates it.")
+            "`lambdachat up` retries, `lambdachat down` terminates it.")
 
 
 def provision(cfg: dict) -> dict:
@@ -543,7 +543,7 @@ def provision(cfg: dict) -> dict:
             STATE_FILE.unlink()
         state = launch(cfg)
     elif state.get("ready") and state.get("model_repo") != cfg["MODEL_REPO"]:
-        die(f"the running box serves {state['model_repo']}; `llmchat down` first to switch to {cfg['MODEL_REPO']}")
+        die(f"the running box serves {state['model_repo']}; `lambdachat down` first to switch to {cfg['MODEL_REPO']}")
     wait_active(state)
     state["idle_min"] = cfg["IDLE_MIN"]
     save_state(state)
@@ -555,18 +555,18 @@ def provision(cfg: dict) -> dict:
     else:
         terminate(state["instance_id"])
         STATE_FILE.unlink(missing_ok=True)
-        die(f"cannot ssh to ubuntu@{state['ip']} after 5 min, so the box was terminated; try `llmchat up` again")
+        die(f"cannot ssh to ubuntu@{state['ip']} after 5 min, so the box was terminated; try `lambdachat up` again")
 
     try:
         # Ship the box scripts, the Lambda key (for idle self-termination) and an HF token if there is one.
         tar = subprocess.Popen(["tar", "--no-xattrs", "-C", str(REPO), "-cf", "-", "box"], stdout=subprocess.PIPE,
                                env=dict(os.environ, COPYFILE_DISABLE="1"))
-        ssh(state, "rm -rf ~/llmchat-box && mkdir ~/llmchat-box && tar -xf - -C ~/llmchat-box --strip-components=1",
+        ssh(state, "rm -rf ~/lambdachat-box && mkdir ~/lambdachat-box && tar -xf - -C ~/lambdachat-box --strip-components=1",
             stdin=tar.stdout, check=True)
         tar.wait()
         if cfg["IDLE_MIN"] > 0:
-            ssh(state, "sudo install -d -m 700 /etc/llmchat && sudo tee /etc/llmchat/lambda-api-key >/dev/null"
-                       " && sudo chmod 600 /etc/llmchat/lambda-api-key", input=lambda_key().encode(), check=True)
+            ssh(state, "sudo install -d -m 700 /etc/lambdachat && sudo tee /etc/lambdachat/lambda-api-key >/dev/null"
+                       " && sudo chmod 600 /etc/lambdachat/lambda-api-key", input=lambda_key().encode(), check=True)
         hf_file = Path("~/.cache/huggingface/token").expanduser()
         hf_token = os.environ.get("HF_TOKEN") or (hf_file.read_text().strip() if hf_file.exists() else "")
         if hf_token:
@@ -579,14 +579,14 @@ def provision(cfg: dict) -> dict:
                "GPU_MEMORY_UTILIZATION": cfg["GPU_MEMORY_UTILIZATION"], "VLLM_ARGS": cfg.get("VLLM_ARGS", ""),
                "TP": state.get("gpus", 1), "IDLE_MIN": cfg["IDLE_MIN"], "INSTANCE_ID": state["instance_id"]}
         remote = ("env " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
-                  + " bash ~/llmchat-box/provision.sh")
+                  + " bash ~/lambdachat-box/provision.sh")
         print(f"Provisioning (vLLM + {cfg['MODEL_REPO']}); first run takes ~10 min ...", flush=True)
         if ssh(state, remote).returncode != 0:
-            raise RuntimeError("provisioning failed (output above); `llmchat logs` shows the vLLM log")
-        served = json.loads(ssh(state, "cat ~/llmchat-served.json", capture_output=True, check=True, text=True).stdout)
+            raise RuntimeError("provisioning failed (output above); `lambdachat logs` shows the vLLM log")
+        served = json.loads(ssh(state, "cat ~/lambdachat-served.json", capture_output=True, check=True, text=True).stdout)
     except (RuntimeError, subprocess.CalledProcessError, ValueError, KeyboardInterrupt) as e:
         print(f"\n{RED}{e if not isinstance(e, KeyboardInterrupt) else 'interrupted'}{RESET}", file=sys.stderr)
-        watchdog = cfg["IDLE_MIN"] > 0 and ssh(state, "systemctl is-active -q llmchat-idle.timer",
+        watchdog = cfg["IDLE_MIN"] > 0 and ssh(state, "systemctl is-active -q lambdachat-idle.timer",
                                                 capture_output=True).returncode == 0
         die(still_billing(state, watchdog))
 
@@ -600,10 +600,10 @@ def provision(cfg: dict) -> dict:
 def cmd_up(cfg: dict, args=None) -> dict:
     with lock("up"):
         state = provision(cfg)
-    print("  llmchat ui      chat in the browser\n"
-          "  llmchat chat    chat in the terminal\n"
-          "  llmchat api     endpoint for scripts and eval harnesses\n"
-          "  llmchat down    terminate the box")
+    print("  lambdachat ui      chat in the browser\n"
+          "  lambdachat chat    chat in the terminal\n"
+          "  lambdachat api     endpoint for scripts and eval harnesses\n"
+          "  lambdachat down    terminate the box")
     return state
 
 
@@ -617,7 +617,7 @@ def ensure_box(cfg: dict) -> dict:
     for key in ("MODEL_REPO", "MODEL_REVISION"):
         if state.get(key.lower()) != cfg[key]:
             die(f"the running box serves {state['model_repo']}@{state.get('model_revision')} but config asks for "
-                f"{cfg['MODEL_REPO']}@{cfg['MODEL_REVISION']}; `llmchat down` and then `llmchat up` to switch")
+                f"{cfg['MODEL_REPO']}@{cfg['MODEL_REVISION']}; `lambdachat down` and then `lambdachat up` to switch")
     touch_idle(state)
     return state
 
@@ -626,7 +626,7 @@ def cmd_adopt(cfg: dict, args) -> None:
     with lock("up"):
         old = load_state()
         if old and old.get("instance_id") != args.instance_id and live_instance(old):
-            die(f"already managing {old['instance_id']}; `llmchat down` it first (or use another LLMCHAT_STATE_DIR)")
+            die(f"already managing {old['instance_id']}; `lambdachat down` it first (or use another LAMBDACHAT_STATE_DIR)")
         tunnel_down(old)
         inst = lam("GET", f"/instances/{args.instance_id}")
         it = inst["instance_type"]
@@ -635,7 +635,7 @@ def cmd_adopt(cfg: dict, args) -> None:
                     "region": inst["region"]["name"], "price_cents_per_hour": it["price_cents_per_hour"],
                     "gpus": it["specs"]["gpus"], "launched_at": launched, "model_repo": cfg["MODEL_REPO"],
                     "model_revision": cfg["MODEL_REVISION"], "served_name": cfg["SERVED_NAME"], "ready": False})
-    print(f"Adopted {inst['id']} ({it['name']}, {inst.get('ip')}). Run `llmchat up` to provision it.")
+    print(f"Adopted {inst['id']} ({it['name']}, {inst.get('ip')}). Run `lambdachat up` to provision it.")
 
 
 def cost_note(state: dict) -> str:
@@ -667,31 +667,31 @@ def cmd_down(cfg: dict, args) -> None:
 def cmd_status(cfg: dict, args) -> None:
     state = load_state()
     if not state:
-        print("No box. `llmchat up` starts one.")
+        print("No box. `lambdachat up` starts one.")
         return
     inst = live_instance(state)
     rev = (state.get("revision_sha") or "?")[:7]
     print(f"model     {state['model_repo']} @ {rev}  (served as {state['served_name']})")
     if not inst:
         print(f"box       {state['instance_id']} is gone (terminated, possibly by the idle watchdog). "
-              "`llmchat up` starts a new one.")
+              "`lambdachat up` starts a new one.")
         return
     print(f"box       {state['instance_type']} {state['region']} {inst.get('ip')} {inst['status']}"
           f"  ${state['price_cents_per_hour'] / 100:.2f}/hr{cost_note(state)}")
     if not state.get("ip"):
-        print("          still booting (`llmchat up` waits for it)")
+        print("          still booting (`lambdachat up` waits for it)")
         return
     r = ssh(state, "curl -fs -m 5 -o /dev/null 127.0.0.1:8000/health && echo up || echo down;"
-                   " sudo cat /var/lib/llmchat/last_active 2>/dev/null || echo -;"
-                   " sudo test -e /var/lib/llmchat/keep && echo keep || echo nokeep;"
-                   " systemctl is-active llmchat-idle.timer", capture_output=True, text=True)
+                   " sudo cat /var/lib/lambdachat/last_active 2>/dev/null || echo -;"
+                   " sudo test -e /var/lib/lambdachat/keep && echo keep || echo nokeep;"
+                   " systemctl is-active lambdachat-idle.timer", capture_output=True, text=True)
     lines = (r.stdout.split() + ["?"] * 4)[:4]
     print(f"vLLM      {lines[0] if r.returncode == 0 else 'unknown (ssh failed)'}"
-          f"{'' if state.get('ready') else '  (not provisioned yet: run llmchat up)'}")
+          f"{'' if state.get('ready') else '  (not provisioned yet: run lambdachat up)'}")
     if lines[3] != "active":
         print("idle      auto-terminate off")
     elif lines[2] == "keep":
-        print("idle      auto-terminate paused (llmchat keepalive off to resume)")
+        print("idle      auto-terminate paused (lambdachat keepalive off to resume)")
     elif lines[1].isdigit():
         idle = (time.time() - int(lines[1])) / 60
         print(f"idle      {idle:.0f} min since last request; terminates at {state.get('idle_min', cfg['IDLE_MIN'])}"
@@ -705,18 +705,18 @@ def cmd_status(cfg: dict, args) -> None:
 def cmd_keepalive(cfg: dict, args) -> None:
     state = need_box()
     if not live_instance(state):
-        die("the box is gone (`llmchat up` starts a new one)")
+        die("the box is gone (`lambdachat up` starts a new one)")
     if args.mode == "on":
-        ssh(state, "sudo touch /var/lib/llmchat/keep", check=True)
-        print("Idle auto-terminate paused. The box bills until `llmchat down` or `llmchat keepalive off`.")
+        ssh(state, "sudo touch /var/lib/lambdachat/keep", check=True)
+        print("Idle auto-terminate paused. The box bills until `lambdachat down` or `lambdachat keepalive off`.")
         return
-    r = ssh(state, "sudo rm -f /var/lib/llmchat/keep && date +%s | sudo tee /var/lib/llmchat/last_active >/dev/null"
-                   " && systemctl is-active -q llmchat-idle.timer", capture_output=True)
+    r = ssh(state, "sudo rm -f /var/lib/lambdachat/keep && date +%s | sudo tee /var/lib/lambdachat/last_active >/dev/null"
+                   " && systemctl is-active -q lambdachat-idle.timer", capture_output=True)
     if r.returncode == 0:
         print(f"Idle auto-terminate on ({state.get('idle_min', cfg['IDLE_MIN'])} min, counting from now).")
     else:
         print("Keep flag cleared, but the idle timer is not running on this box (IDLE_MIN=0 or not provisioned); "
-              "re-run `llmchat up` with IDLE_MIN > 0 to enable it.")
+              "re-run `lambdachat up` with IDLE_MIN > 0 to enable it.")
 
 
 def cmd_logs(cfg: dict, args) -> None:
@@ -735,11 +735,11 @@ def cmd_api(cfg: dict, args) -> None:
         # Output is eval'd by the shell: never launch from here, and print nothing but the exports on stdout.
         state = load_state()
         if not (state and state.get("ready") and live_instance(state)):
-            die("no ready box; run `llmchat up` first")
+            die("no ready box; run `lambdachat up` first")
         touch_idle(state)
         tunnel_up(state, cfg)
         print(f"export OPENAI_BASE_URL={base}\nexport OPENAI_API_KEY=EMPTY\n"
-              f"export LLMCHAT_MODEL={shlex.quote(state['served_name'])}")
+              f"export LAMBDACHAT_MODEL={shlex.quote(state['served_name'])}")
         return
     state = ensure_box(cfg)
     tunnel_up(state, cfg)
@@ -926,7 +926,7 @@ class Chat:
             return False
         except (*NET_ERRORS, RuntimeError) as e:
             if not content and not reasoning:
-                print(f"{RESET}\n{RED}can't reach the model ({e}).{RESET} The box may be gone: try `llmchat status`.")
+                print(f"{RESET}\n{RED}can't reach the model ({e}).{RESET} The box may be gone: try `lambdachat status`.")
                 return False
             print(f"{RESET}\n{RED}connection lost mid-reply ({e}); keeping the partial reply.{RESET}")
             finish = "connection_lost"
@@ -1097,7 +1097,7 @@ def cmd_chat(cfg: dict, args) -> None:
     state = ensure_box(cfg)
     tunnel_up(state, cfg)
     if not http_ok(f"http://127.0.0.1:{cfg['API_PORT']}/health", timeout=10):
-        die("the tunnel is up but vLLM is not answering; check `llmchat logs`")
+        die("the tunnel is up but vLLM is not answering; check `lambdachat logs`")
     Chat(cfg, state, args).loop()
 
 
@@ -1105,7 +1105,7 @@ def cmd_chat(cfg: dict, args) -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="llmchat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(prog="lambdachat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("up", help="launch and provision a box (reuses a running one)").set_defaults(fn=cmd_up)
     p = sub.add_parser("ui", help="open the local Open WebUI")
@@ -1118,7 +1118,7 @@ def main() -> None:
     p.add_argument("--hide-thinking", action="store_true", help="don't print reasoning (it is still saved)")
     p.set_defaults(fn=cmd_chat)
     p = sub.add_parser("api", help="open the tunnel and print the endpoint")
-    p.add_argument("--env", action="store_true", help="print export lines: eval \"$(llmchat api --env)\"")
+    p.add_argument("--env", action="store_true", help="print export lines: eval \"$(lambdachat api --env)\"")
     p.set_defaults(fn=cmd_api)
     sub.add_parser("status", help="box, cost, idle timer, tunnel, UI").set_defaults(fn=cmd_status)
     p = sub.add_parser("keepalive", help="pause (on) or resume (off) idle auto-terminate")

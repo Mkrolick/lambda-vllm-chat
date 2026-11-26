@@ -24,25 +24,25 @@ export PATH=$HOME/.local/bin:$PATH
 
 step() { printf '\n==> %s\n' "$*"; }
 
-exec 9>/tmp/llmchat-provision.lock
+exec 9>/tmp/lambdachat-provision.lock
 flock -w 1800 9 || { echo "another provisioning run is still going"; exit 1; }
 
 step "Idle watchdog (terminate after $IDLE_MIN min without requests)"
-sudo install -d -m 700 /etc/llmchat /var/lib/llmchat
-sudo install -m 755 "$HERE/idle-terminate.sh" /usr/local/bin/llmchat-idle-terminate
-printf 'INSTANCE_ID=%s\nIDLE_MIN=%s\n' "$INSTANCE_ID" "$IDLE_MIN" | sudo tee /etc/llmchat/idle.env >/dev/null
+sudo install -d -m 700 /etc/lambdachat /var/lib/lambdachat
+sudo install -m 755 "$HERE/idle-terminate.sh" /usr/local/bin/lambdachat-idle-terminate
+printf 'INSTANCE_ID=%s\nIDLE_MIN=%s\n' "$INSTANCE_ID" "$IDLE_MIN" | sudo tee /etc/lambdachat/idle.env >/dev/null
 # Idle time counts from 30 min from now while provisioning runs; set to "now" once the model is up. If this run fails,
 # the box terminates itself IDLE_MIN minutes after that.
-echo $(( $(date +%s) + 1800 )) | sudo tee /var/lib/llmchat/last_active >/dev/null
-sudo tee /etc/systemd/system/llmchat-idle.service >/dev/null <<EOF
+echo $(( $(date +%s) + 1800 )) | sudo tee /var/lib/lambdachat/last_active >/dev/null
+sudo tee /etc/systemd/system/lambdachat-idle.service >/dev/null <<EOF
 [Unit]
 Description=Terminate this Lambda box when the model has been idle for IDLE_MIN minutes
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/llmchat-idle-terminate
+ExecStart=/usr/local/bin/lambdachat-idle-terminate
 EOF
-sudo tee /etc/systemd/system/llmchat-idle.timer >/dev/null <<EOF
+sudo tee /etc/systemd/system/lambdachat-idle.timer >/dev/null <<EOF
 [Unit]
 Description=Check model idleness every 5 minutes
 
@@ -54,12 +54,12 @@ OnUnitActiveSec=5min
 WantedBy=timers.target
 EOF
 sudo systemctl daemon-reload
-if [ "$IDLE_MIN" -gt 0 ] && sudo test -s /etc/llmchat/lambda-api-key; then
-  sudo systemctl enable -q --now llmchat-idle.timer
+if [ "$IDLE_MIN" -gt 0 ] && sudo test -s /etc/lambdachat/lambda-api-key; then
+  sudo systemctl enable -q --now lambdachat-idle.timer
   echo "on"
 else
-  sudo systemctl disable -q --now llmchat-idle.timer 2>/dev/null || true
-  sudo rm -f /etc/llmchat/lambda-api-key
+  sudo systemctl disable -q --now lambdachat-idle.timer 2>/dev/null || true
+  sudo rm -f /etc/lambdachat/lambda-api-key
   echo "off (IDLE_MIN=0 or no API key on the box)"
 fi
 
@@ -114,8 +114,8 @@ LD_LIBRARY_PATH=$COMPAT "$PY" -c 'import torch; assert torch.cuda.is_available()
 step "Wait for download"
 if ! wait "$DL"; then tail -20 "$HOME/download.log"; exit 1; fi
 du -sh "$MODEL_DIR"
-printf '%s\n' "$SHA" >"$MODEL_DIR/.llmchat-revision"
-"$PY" - "$MODEL_REPO" "$SHA" "$MODEL_DIR" "$COMPAT" >"$HOME/llmchat-served.json" <<'PYEOF'
+printf '%s\n' "$SHA" >"$MODEL_DIR/.lambdachat-revision"
+"$PY" - "$MODEL_REPO" "$SHA" "$MODEL_DIR" "$COMPAT" >"$HOME/lambdachat-served.json" <<'PYEOF'
 import importlib.metadata as m, json, pathlib, sys
 repo, sha, model_dir, compat = sys.argv[1:]
 gen = pathlib.Path(model_dir, "generation_config.json")
@@ -142,7 +142,7 @@ WorkingDirectory=$HOME
 Environment=LD_LIBRARY_PATH=$COMPAT
 Environment=HF_HUB_OFFLINE=1
 Environment=VLLM_NO_USAGE_STATS=1
-Environment=LLMCHAT_VLLM_VERSION=$VLLM_VERSION
+Environment=LAMBDACHAT_VLLM_VERSION=$VLLM_VERSION
 ExecStart=$VENV/bin/vllm serve $MODEL_DIR --served-model-name $SERVED_NAME --host 127.0.0.1 --port 8000 --tensor-parallel-size $TP --max-model-len $MAX_MODEL_LEN --max-num-seqs $MAX_NUM_SEQS --gpu-memory-utilization $GPU_MEMORY_UTILIZATION $VLLM_ARGS
 Restart=on-failure
 RestartSec=10
@@ -165,7 +165,7 @@ step "Wait for the model to load"
 for i in $(seq 1 180); do
   if curl -fs -m 5 http://127.0.0.1:8000/health >/dev/null; then
     echo "ready after ~$((i * 10)) s"
-    date +%s | sudo tee /var/lib/llmchat/last_active >/dev/null
+    date +%s | sudo tee /var/lib/lambdachat/last_active >/dev/null
     curl -fs http://127.0.0.1:8000/v1/models | "$PY" -c 'import json,sys; [print("serving", m["id"], "max_model_len", m.get("max_model_len")) for m in json.load(sys.stdin)["data"]]'
     exit 0
   fi
