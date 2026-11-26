@@ -1,4 +1,4 @@
-# lambda-llm-chat
+# lambda-vllm-chat
 
 Serve a Hugging Face model with vLLM on a Lambda Cloud GPU box and chat with it from your laptop, either in a browser
 (Open WebUI) or in the terminal. Every conversation is saved locally. The box terminates itself after it has been idle for 2 hours.
@@ -9,8 +9,8 @@ The default model is [huihui-ai/Huihui-Qwen3.8-27B-abliterated](https://huggingf
 ## Setup (once)
 
 ```bash
-git clone https://github.com/Mkrolick/lambda-llm-chat ~/Code/lambda-llm-chat
-ln -s ~/Code/lambda-llm-chat/llmchat ~/bin/llmchat     # or anywhere on your PATH
+git clone https://github.com/Mkrolick/lambda-vllm-chat ~/Code/lambda-vllm-chat
+ln -s ~/Code/lambda-vllm-chat/llmchat ~/bin/llmchat     # or anywhere on your PATH
 ```
 
 You need:
@@ -37,7 +37,7 @@ automatically when no box is running.
 | `llmchat up` | Launch the cheapest Lambda box with capacity that fits the model, install vLLM, download the model, start serving. If a box is already running, it is re-provisioned in place (safe to re-run). |
 | `llmchat ui [--no-open]` | Start Open WebUI locally and open it. Chats are stored on your machine, so they survive the box being terminated. |
 | `llmchat chat` | Terminal chat. `/help` lists commands (system prompt, thinking on/off, sampling, images, retry, undo). |
-| `llmchat api [--env]` | Open the tunnel and print the OpenAI-compatible endpoint. `eval "$(llmchat api --env)"` exports `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `LLMCHAT_MODEL`. |
+| `llmchat api [--env]` | Open the tunnel and print the OpenAI-compatible endpoint. `eval "$(llmchat api --env)"` exports `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `LLMCHAT_MODEL` (it needs a running box and never launches one). |
 | `llmchat status` | Model and revision, instance, cost so far, minutes idle, tunnel, UI. |
 | `llmchat keepalive on\|off` | Pause or resume idle auto-terminate. |
 | `llmchat logs` | Follow the vLLM log on the box. |
@@ -76,8 +76,8 @@ top_p 0.95, top_k 20 for this model).
 
 - `meta`: model repo, exact commit sha, instance type, vLLM version, the model's default sampling
 - `system_prompt`
-- `turns`: each message with timestamp. Assistant turns also record their reasoning, usage, finish reason, and the
-  request settings used (system prompt, sampling, chat template kwargs).
+- `turns`: each message with timestamp. Assistant turns also record their reasoning, usage, finish reason, the
+  request settings used (system prompt, sampling, chat template kwargs), and the box and model commit that answered.
 - `discarded`: replies dropped with `/retry` or `/undo`
 
 Open WebUI keeps its own history in `~/LLM-Chat/open-webui/` and can export chats as JSON.
@@ -92,7 +92,7 @@ fresh box.
 
 ## Configuration
 
-Defaults are in [`config.env`](config.env). Override any value in `~/.config/lambda-llm-chat/config.env`, or for one run with
+Defaults are in [`config.env`](config.env). Override any value in `~/.config/lambda-vllm-chat/config.env`, or for one run with
 `LLMCHAT_<KEY>=value`:
 
 ```bash
@@ -101,13 +101,15 @@ LLMCHAT_INSTANCE_TYPES=gpu_1x_h100_sxm5 llmchat up                           # c
 LLMCHAT_IDLE_MIN=0 llmchat up                                                # never auto-terminate
 ```
 
-To serve a different model, set `MODEL_REPO` (and `MIN_VRAM_GB` if it needs more or less memory). Running a different
-model needs `llmchat down` first. Running two boxes at once needs a separate state directory and separate ports:
-`LLMCHAT_STATE_DIR=~/.config/lambda-llm-chat-2`, with its own `config.env` there setting `API_PORT` and `UI_PORT`.
+To serve a different model, set `MODEL_REPO` (and `MIN_VRAM_GB` if it needs more or less memory). Switching models or
+revisions needs `llmchat down` first. Running two boxes at once needs a separate state directory
+(`LLMCHAT_STATE_DIR=~/.config/lambda-vllm-chat-2`), with its own `config.env` there setting `API_PORT`, `UI_PORT` and
+`DATA_DIR`.
 
 ## How it works
 
 - **Box** (`box/provision.sh`, run over SSH):
+  - Installs the idle watchdog first, so a box whose provisioning fails still terminates itself.
   - Installs uv, Python 3.12 and vLLM.
   - Downloads the weights at a resolved commit sha while vLLM installs.
   - Runs `vllm serve` as a systemd service bound to `127.0.0.1:8000`.
@@ -118,8 +120,11 @@ model needs `llmchat down` first. Running two boxes at once needs a separate sta
 - **Laptop**:
   - An SSH tunnel forwards `127.0.0.1:18000` to vLLM, and a small background process reopens it if it drops (sleep,
     network change).
-  - Open WebUI runs locally on `127.0.0.1:13000` with login disabled and its background title/tag generation turned off,
-    so the only requests to the model are yours.
+  - Open WebUI runs locally on `127.0.0.1:13000` with login disabled. To keep that safe and the evals clean:
+    - Only its own origin may call its API (CORS), so other websites can't use the no-login admin session.
+    - Tools, code execution, automations, web search and memory are off, so the model can't run anything on your
+      machine and nothing extra is added to its prompts.
+    - Background title/tag/follow-up generation is off, so the only requests to the model are yours.
   - Nothing is exposed publicly. vLLM and the UI listen on localhost only, and the box is reached over SSH.
 
 ## Troubleshooting
@@ -128,4 +133,4 @@ model needs `llmchat down` first. Running two boxes at once needs a separate sta
 - Hybrid linear-attention models like Qwen3.8 need `--max-num-seqs` at or below the number of cache blocks that fit.
   `MAX_NUM_SEQS=128` works on 80 GB. vLLM's default of 1024 fails at startup.
 - "no capacity right now": Lambda has no fitting GPU free. Retry later, or widen `INSTANCE_TYPES`, `MAX_GPUS` or `MIN_VRAM_GB`.
-- Logs on your machine: `~/.config/lambda-llm-chat/tunnel-keeper.log` and `~/LLM-Chat/open-webui/webui.log`.
+- Logs on your machine: `~/.config/lambda-vllm-chat/tunnel-keeper.log` and `~/LLM-Chat/open-webui/webui.log`.

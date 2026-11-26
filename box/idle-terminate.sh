@@ -25,4 +25,4 @@ echo "idle ${idle_min}/${IDLE_MIN} min (requests done: $done_total, in flight: $
 echo "idle for $idle_min min: terminating instance $INSTANCE_ID"
 curl -fsS -m 60 -X POST https://cloud.lambda.com/api/v1/instance-operations/terminate \
   -H "Authorization: Bearer $(cat /etc/llmchat/lambda-api-key)" -H "Content-Type: application/json" \
-  -A lambda-llm-chat -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}"
+  -A lambda-vllm-chat -d "{\"instance_ids\": [\"$INSTANCE_ID\"]}"
