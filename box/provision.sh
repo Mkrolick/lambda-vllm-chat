@@ -64,6 +64,9 @@ else
 fi
 
 
+step "Close Lambda's public JupyterLab (a Cloudflare tunnel to a shell on this box, guarded only by a token)"
+sudo systemctl disable -q --now lambda-jupyter.service cloudflared.service 2>/dev/null || true
+
 step "Python env"
 command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
 [ -x "$PY" ] || uv venv -q --python 3.12 "$VENV"

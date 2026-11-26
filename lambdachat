@@ -100,6 +100,7 @@ def load_config() -> dict:
             cfg[k[len("LAMBDACHAT_"):]] = v
     cfg["SERVED_NAME"] = cfg.get("SERVED_NAME") or cfg["MODEL_REPO"].split("/")[-1].lower()
     cfg["DATA_DIR"] = str(Path(cfg.get("DATA_DIR") or "~/LLM-Chat").expanduser())
+    Path(cfg["DATA_DIR"]).mkdir(mode=0o700, parents=True, exist_ok=True)  # transcripts: readable only by you
     for k in ("API_PORT", "UI_PORT", "IDLE_MIN", "MIN_VRAM_GB", "MAX_GPUS"):
         cfg[k] = int(cfg[k])
     return cfg
@@ -110,7 +111,7 @@ def load_state() -> dict | None:
 
 
 def save_state(state: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = STATE_FILE.with_suffix(f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(state, indent=2) + "\n")
     tmp.replace(STATE_FILE)
@@ -289,7 +290,7 @@ def wait_active(state: dict) -> dict:
 
 
 def ssh_opts() -> list[str]:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     return ["-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
             "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "LogLevel=ERROR"]
 

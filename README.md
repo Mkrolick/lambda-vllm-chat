@@ -125,7 +125,10 @@ revisions needs `lambdachat down` first. Running two boxes at once needs a separ
     - Tools, code execution, automations, web search and memory are off, so the model can't run anything on your
       machine and nothing extra is added to its prompts.
     - Background title/tag/follow-up generation is off, so the only requests to the model are yours.
-  - Nothing is exposed publicly. vLLM and the UI listen on localhost only, and the box is reached over SSH.
+  - Nothing is exposed publicly. vLLM and the UI listen on localhost only, and the box is reached over SSH (Lambda's
+    firewall allows only port 22). Provisioning also turns off the JupyterLab that Lambda's image publishes through a
+    Cloudflare tunnel.
+  - Neither the UI nor the API asks for a password. Anything running as your user on this machine can use them.
 
 ## Troubleshooting
 
