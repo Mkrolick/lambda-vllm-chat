@@ -1,0 +1,931 @@
+#!/usr/bin/env python3
+"""llmchat: serve a Hugging Face model with vLLM on a Lambda Cloud GPU box and chat with it from this machine.
+
+  llmchat up                 launch a box (cheapest that fits) and serve the model; reuses a running box
+  llmchat ui                 Open WebUI in the browser (local, http://localhost:13000); runs `up` first if needed
+  llmchat chat               terminal chat; every conversation is saved as JSON
+  llmchat api [--env]        open the tunnel and print the OpenAI-compatible endpoint for scripts and eval harnesses
+  llmchat status             box, model, cost so far, idle timer, tunnel and UI
+  llmchat keepalive on|off   turn the box's idle auto-terminate off or back on
+  llmchat logs               follow the vLLM log on the box
+  llmchat ssh [cmd...]       shell on the box
+  llmchat down               terminate the box and stop the tunnel and local UI
+  llmchat adopt ID           manage an instance launched some other way (then run `llmchat up` to provision it)
+
+Settings live in config.env next to this script; override them in ~/.config/lambda-llm-chat/config.env or with
+LLMCHAT_<KEY>=value. The Lambda API key comes from $LAMBDA_API_KEY or ~/.config/lambda/api-key.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import http.client
+import json
+import mimetypes
+import os
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REPO = Path(os.path.realpath(__file__)).parent
+STATE_DIR = Path(os.environ.get("LLMCHAT_STATE_DIR", "~/.config/lambda-llm-chat")).expanduser()
+STATE_FILE = STATE_DIR / "state.json"
+TUNNEL_SOCK = STATE_DIR / "tunnel.sock"
+WEBUI_PID = STATE_DIR / "webui.pid"
+KEEPER_PID = STATE_DIR / "tunnel-keeper.pid"
+KNOWN_HOSTS = STATE_DIR / "known_hosts"
+LAMBDA_API = "https://cloud.lambda.com/api/v1"
+UA = "lambda-llm-chat"  # Lambda's edge rejects the default Python-urllib user agent
+ALIVE = ("booting", "active", "unhealthy")
+
+TTY = sys.stdout.isatty()
+DIM, BOLD, CYAN, RED, RESET = ("\033[2m", "\033[1m", "\033[36m", "\033[31m", "\033[0m") if TTY else ("",) * 5
+
+
+def die(msg: str) -> None:
+    print(f"{RED}error:{RESET} {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+# ---------------------------------------------------------------- config and state
+
+
+def load_config() -> dict:
+    cfg: dict = {}
+    for f in (REPO / "config.env", STATE_DIR / "config.env"):
+        if f.exists():
+            for line in f.read_text().splitlines():
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    cfg[k.strip()] = v.strip()
+    for k, v in os.environ.items():
+        if k.startswith("LLMCHAT_") and k != "LLMCHAT_STATE_DIR":
+            cfg[k[len("LLMCHAT_"):]] = v
+    cfg["SERVED_NAME"] = cfg.get("SERVED_NAME") or cfg["MODEL_REPO"].split("/")[-1].lower()
+    cfg["DATA_DIR"] = str(Path(cfg.get("DATA_DIR") or "~/LLM-Chat").expanduser())
+    for k in ("API_PORT", "UI_PORT", "IDLE_MIN", "MIN_VRAM_GB", "MAX_GPUS"):
+        cfg[k] = int(cfg[k])
+    return cfg
+
+
+def load_state() -> dict | None:
+    return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else None
+
+
+def save_state(state: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n")
+    tmp.replace(STATE_FILE)
+
+
+# ---------------------------------------------------------------- Lambda Cloud API
+
+
+class LambdaError(Exception):
+    def __init__(self, code: int, detail: str):
+        super().__init__(f"Lambda API {code}: {detail}")
+        self.code = code
+
+
+def lambda_key() -> str:
+    key = os.environ.get("LAMBDA_API_KEY", "").strip()
+    f = Path("~/.config/lambda/api-key").expanduser()
+    if not key and f.exists():
+        key = (f.read_text().split() or [""])[0]
+    if not key:
+        die("no Lambda API key: set LAMBDA_API_KEY or put the key in ~/.config/lambda/api-key")
+    return key
+
+
+def lam(method: str, path: str, body: dict | None = None, timeout: int = 60):
+    req = urllib.request.Request(LAMBDA_API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    req.add_header("Authorization", f"Bearer {lambda_key()}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", UA)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read())["data"]
+    except urllib.error.HTTPError as e:
+        raise LambdaError(e.code, e.read().decode(errors="replace")[:400]) from None
+
+
+def live_instance(state: dict | None) -> dict | None:
+    if not state:
+        return None
+    try:
+        inst = lam("GET", f"/instances/{state['instance_id']}")
+    except LambdaError as e:
+        if e.code == 404:
+            return None
+        raise
+    return inst if inst.get("status") in ALIVE else None
+
+
+def choose_type(cfg: dict) -> tuple[str, str, int, int]:
+    """(type name, region, price in cents/hr, gpu count) of the instance type to launch."""
+    want = [t.strip() for t in cfg.get("INSTANCE_TYPES", "").split(",") if t.strip()]
+    fits, offers = [], []
+    for name, t in lam("GET", "/instance-types").items():
+        it = t["instance_type"]
+        gpus = it["specs"]["gpus"]
+        m = re.search(r"(\d+)\s*GB", it.get("gpu_description") or it.get("description") or "")
+        vram = int(m.group(1)) if m else 0
+        arm = "gh200" in name.lower() or "gh200" in (it.get("description") or "").lower()
+        if want and name not in want:
+            continue
+        if not want and (arm or gpus > cfg["MAX_GPUS"] or gpus * vram < cfg["MIN_VRAM_GB"]):
+            continue
+        fits.append(name)
+        regions = [r["name"] for r in t.get("regions_with_capacity_available", [])]
+        if regions:
+            rank = want.index(name) if want else it["price_cents_per_hour"]
+            offers.append((rank, name, sorted(regions)[0], it["price_cents_per_hour"], gpus))
+    if not offers:
+        die(f"no capacity right now for any fitting instance type ({', '.join(sorted(fits)) or 'none fit'}). "
+            "Try again in a few minutes, or widen MIN_VRAM_GB / MAX_GPUS / INSTANCE_TYPES.")
+    _, name, region, price, gpus = min(offers)
+    return name, region, price, gpus
+
+
+def ssh_key_name(cfg: dict) -> str:
+    if cfg.get("SSH_KEY_NAME"):
+        return cfg["SSH_KEY_NAME"]
+    pubs = [p for p in (Path(f"~/.ssh/{n}.pub").expanduser() for n in ("id_ed25519", "id_ecdsa", "id_rsa")) if p.exists()]
+    if not pubs:
+        die("no SSH key in ~/.ssh (id_ed25519/id_ecdsa/id_rsa); create one with ssh-keygen")
+    remote = lam("GET", "/ssh-keys")
+    for p in pubs:
+        local = p.read_text().split()[:2]
+        for k in remote:
+            if k["public_key"].split()[:2] == local:
+                return k["name"]
+    name = f"llmchat-{socket.gethostname().split('.')[0]}"
+    lam("POST", "/ssh-keys", {"name": name, "public_key": pubs[0].read_text().strip()})
+    print(f"Added {pubs[0]} to Lambda as SSH key '{name}'")
+    return name
+
+
+# ---------------------------------------------------------------- ssh, tunnel, local UI
+
+
+def ssh_opts() -> list[str]:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    return ["-o", "StrictHostKeyChecking=accept-new", "-o", f"UserKnownHostsFile={KNOWN_HOSTS}",
+            "-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=30", "-o", "LogLevel=ERROR"]
+
+
+def ssh(state: dict, cmd: str, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(["ssh", *ssh_opts(), f"ubuntu@{state['ip']}", cmd], **kw)
+
+
+def port_open(port: int) -> bool:
+    with socket.socket() as s:
+        s.settimeout(0.5)
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def tunnel_alive(state: dict) -> bool:
+    return TUNNEL_SOCK.exists() and subprocess.run(
+        ["ssh", "-S", str(TUNNEL_SOCK), "-O", "check", f"ubuntu@{state['ip']}"], capture_output=True).returncode == 0
+
+
+def open_tunnel(state: dict, cfg: dict) -> None:
+    """Forward 127.0.0.1:API_PORT to vLLM on the box. Raises RuntimeError on failure."""
+    if tunnel_alive(state):
+        return
+    TUNNEL_SOCK.unlink(missing_ok=True)
+    port = cfg["API_PORT"]
+    if port_open(port):
+        raise RuntimeError(f"local port {port} is already in use; set API_PORT in ~/.config/lambda-llm-chat/config.env")
+    log = STATE_DIR / "tunnel.log"
+    with open(log, "w") as f:  # not a pipe: `ssh -f` keeps its stdio open after forking
+        r = subprocess.run(["ssh", *ssh_opts(), "-f", "-N", "-M", "-S", str(TUNNEL_SOCK), "-o", "ExitOnForwardFailure=yes",
+                            "-L", f"127.0.0.1:{port}:127.0.0.1:8000", f"ubuntu@{state['ip']}"],
+                           stdin=subprocess.DEVNULL, stdout=f, stderr=f)
+    if r.returncode != 0:
+        raise RuntimeError(f"ssh tunnel to {state['ip']} failed: {log.read_text().strip()[-300:]}")
+
+
+def tunnel_up(state: dict, cfg: dict) -> None:
+    """Open the tunnel and start the background keeper that reopens it if it drops (sleep, Wi-Fi change)."""
+    try:
+        open_tunnel(state, cfg)
+    except RuntimeError as e:
+        die(str(e))
+    if not pid_alive(KEEPER_PID):
+        log = open(STATE_DIR / "tunnel-keeper.log", "a")
+        p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_keep-tunnel"], stdin=subprocess.DEVNULL,
+                             stdout=log, stderr=log, start_new_session=True)
+        KEEPER_PID.write_text(str(p.pid))
+
+
+def cmd_keep_tunnel(cfg: dict, args) -> None:
+    """Background loop (started by tunnel_up): reopen the tunnel when it drops; exit when the box changes or is gone."""
+    iid = (load_state() or {}).get("instance_id")
+    fails = 0
+    while True:
+        state = load_state()
+        if not state or state.get("instance_id") != iid or not state.get("ip"):
+            return
+        if tunnel_alive(state):
+            fails = 0
+        else:
+            try:
+                open_tunnel(state, cfg)
+                print(f"[{now_iso()}] tunnel reopened", flush=True)
+                fails = 0
+            except RuntimeError as e:
+                fails += 1
+                print(f"[{now_iso()}] {e}", flush=True)
+                if fails % 20 == 0 and live_instance(state) is None:
+                    print(f"[{now_iso()}] box {iid} is gone; exiting", flush=True)
+                    return
+        time.sleep(5)
+
+
+def tunnel_down(state: dict | None) -> None:
+    pid = pid_alive(KEEPER_PID)
+    if pid:
+        os.kill(pid, signal.SIGTERM)
+    KEEPER_PID.unlink(missing_ok=True)
+    if state and TUNNEL_SOCK.exists():
+        subprocess.run(["ssh", "-S", str(TUNNEL_SOCK), "-O", "exit", f"ubuntu@{state['ip']}"], capture_output=True)
+    TUNNEL_SOCK.unlink(missing_ok=True)
+
+
+def http_ok(url: str, timeout: float = 3) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def pid_alive(pidfile: Path) -> int | None:
+    try:
+        pid = int(pidfile.read_text())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def webui_start(cfg: dict) -> None:
+    port = cfg["UI_PORT"]
+    if http_ok(f"http://127.0.0.1:{port}/health"):
+        return
+    exe = shutil.which("open-webui") or str(Path("~/.local/bin/open-webui").expanduser())
+    if not os.access(exe, os.X_OK):
+        if not shutil.which("uv"):
+            die("Open WebUI needs uv: curl -LsSf https://astral.sh/uv/install.sh | sh")
+        print("Installing Open WebUI (one time, a few minutes)...")
+        subprocess.run(["uv", "tool", "install", "--python", "3.12", "open-webui"], check=True)
+        exe = shutil.which("open-webui") or str(Path("~/.local/bin/open-webui").expanduser())
+    if port_open(port):
+        die(f"local port {port} is in use by something other than Open WebUI; set UI_PORT")
+    data = Path(cfg["DATA_DIR"]) / "open-webui"
+    data.mkdir(parents=True, exist_ok=True)
+    api = f"http://127.0.0.1:{cfg['API_PORT']}/v1"
+    env = dict(os.environ,
+               DATA_DIR=str(data), WEBUI_AUTH="False", ENABLE_PERSISTENT_CONFIG="False",
+               OPENAI_API_BASE_URL=api, OPENAI_API_BASE_URLS=api, OPENAI_API_KEY="EMPTY", OPENAI_API_KEYS="EMPTY",
+               ENABLE_OLLAMA_API="False", BYPASS_MODEL_ACCESS_CONTROL="True",
+               # Open WebUI's background tasks (titles, tags, follow-ups...) would also go to the model under test.
+               ENABLE_TITLE_GENERATION="False", ENABLE_TAGS_GENERATION="False", ENABLE_FOLLOW_UP_GENERATION="False",
+               ENABLE_AUTOCOMPLETE_GENERATION="False", ENABLE_SEARCH_QUERY_GENERATION="False",
+               ENABLE_RETRIEVAL_QUERY_GENERATION="False",
+               ANONYMIZED_TELEMETRY="False", DO_NOT_TRACK="True", SCARF_NO_ANALYTICS="True",
+               ENABLE_VERSION_UPDATE_CHECK="False")
+    log = open(data / "webui.log", "ab")
+    p = subprocess.Popen([exe, "serve", "--host", "127.0.0.1", "--port", str(port)], cwd=data, env=env,
+                         stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+    WEBUI_PID.write_text(str(p.pid))
+    print(f"Starting Open WebUI (log: {data / 'webui.log'}) ...", end="", flush=True)
+    for _ in range(300):
+        if http_ok(f"http://127.0.0.1:{port}/health"):
+            print(" ready")
+            return
+        if p.poll() is not None:
+            print()
+            die(f"Open WebUI exited; see {data / 'webui.log'}")
+        time.sleep(1)
+    print()
+    die(f"Open WebUI did not come up in 5 min; see {data / 'webui.log'}")
+
+
+def webui_api(cfg: dict, method: str, path: str, body: dict | None = None, token: str | None = None):
+    req = urllib.request.Request(f"http://127.0.0.1:{cfg['UI_PORT']}{path}", method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json",
+                                          **({"Authorization": f"Bearer {token}"} if token else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode(errors="replace")[:300]
+
+
+def webui_configure(cfg: dict, state: dict) -> None:
+    """Register the served model in Open WebUI with a description and, if its chat template supports it, a Thinking
+    menu (on / medium / low / off) that sets chat_template_kwargs on each request."""
+    status, auth = webui_api(cfg, "POST", "/api/v1/auths/signin", {"email": "admin@localhost", "password": "admin"})
+    if status != 200:
+        print(f"(could not configure Open WebUI: sign-in returned {status})")
+        return
+    token, name = auth["token"], state["served_name"]
+    kwargs = state.get("template_kwargs") or []
+    params: dict = {}
+    if "enable_thinking" in kwargs:
+        def opt(label, **kw):
+            return {"label": label, "params": {"chat_template_kwargs": kw}}
+        options = {"on": opt("On", enable_thinking=True)}
+        if "reasoning_effort" in kwargs:
+            options["medium"] = opt("On, medium effort", enable_thinking=True, reasoning_effort="medium")
+            options["low"] = opt("On, low effort", enable_thinking=True, reasoning_effort="low")
+        options["off"] = opt("Off", enable_thinking=False)
+        params["model_controls"] = {"thinking": {"label": "Thinking", "default": "on", "options": options,
+                                                 "description": "Reasoning mode (chat template kwargs)"}}
+    form = {"id": name, "base_model_id": None, "name": name, "params": params, "is_active": True,
+            "meta": {"description": f"{state['model_repo']} @ {(state.get('revision_sha') or '?')[:7]}, "
+                                    f"vLLM on Lambda {state['instance_type']}"}}
+    exists = webui_api(cfg, "GET", f"/api/v1/models/model?id={name}", token=token)[0] == 200
+    status, _ = webui_api(cfg, "POST", "/api/v1/models/model/update" if exists else "/api/v1/models/create", form, token)
+    if status != 200:
+        print(f"(could not register {name} in Open WebUI: {status})")
+
+
+def webui_stop() -> None:
+    pid = pid_alive(WEBUI_PID)
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            os.kill(pid, signal.SIGTERM)
+    WEBUI_PID.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- commands: box lifecycle
+
+
+def cmd_up(cfg: dict, args=None) -> dict:
+    state = load_state()
+    inst = live_instance(state)
+    if inst is None:
+        if state:
+            tunnel_down(state)
+            STATE_FILE.unlink()
+        itype, region, price, gpus = choose_type(cfg)
+        key = ssh_key_name(cfg)
+        name = f"llmchat-{cfg['SERVED_NAME']}"[:64]
+        print(f"Launching {BOLD}{itype}{RESET} in {region} at {BOLD}${price / 100:.2f}/hr{RESET} (billed until `llmchat down`"
+              + (f" or {cfg['IDLE_MIN']} idle min" if cfg["IDLE_MIN"] else "") + ")")
+        body = {"region_name": region, "instance_type_name": itype, "ssh_key_names": [key], "name": name}
+        try:
+            iid = lam("POST", "/instance-operations/launch", body, timeout=120)["instance_ids"][0]
+        except (TimeoutError, socket.timeout, urllib.error.URLError):
+            # The launch may have gone through anyway; adopt it rather than launching a duplicate.
+            time.sleep(15)
+            same = [i for i in lam("GET", "/instances") if i.get("name") == name and i.get("status") in ALIVE]
+            if not same:
+                raise
+            iid = same[0]["id"]
+        state = {"instance_id": iid, "instance_type": itype, "region": region, "price_cents_per_hour": price,
+                 "gpus": gpus, "launched_at": now_iso(), "model_repo": cfg["MODEL_REPO"],
+                 "model_revision": cfg["MODEL_REVISION"], "served_name": cfg["SERVED_NAME"], "ready": False}
+        save_state(state)
+        print(f"Instance {iid}; waiting for it to boot (usually 2-5 min) ...", end="", flush=True)
+        t0 = time.time()
+        while True:
+            inst = lam("GET", f"/instances/{iid}")
+            if inst.get("status") == "active" and inst.get("ip"):
+                break
+            if inst.get("status") in ("terminated", "terminating", "preempted"):
+                die(f"instance went {inst['status']} while booting")
+            if time.time() - t0 > 1200:
+                die("instance did not become active within 20 min; check `llmchat status`")
+            time.sleep(10)
+            print(".", end="", flush=True)
+        print(f" active at {inst['ip']}")
+        if KNOWN_HOSTS.exists():  # Lambda reuses IPs; drop any old host key for this one
+            subprocess.run(["ssh-keygen", "-R", inst["ip"], "-f", str(KNOWN_HOSTS)], capture_output=True)
+    elif state.get("ready") and state.get("model_repo") != cfg["MODEL_REPO"]:
+        die(f"the running box serves {state['model_repo']}; `llmchat down` first to switch to {cfg['MODEL_REPO']}")
+    state["ip"] = inst["ip"]
+    save_state(state)
+
+    for _ in range(60):
+        if ssh(state, "true", capture_output=True).returncode == 0:
+            break
+        time.sleep(5)
+    else:
+        die(f"cannot ssh to ubuntu@{state['ip']}")
+
+    # Ship the box scripts, the Lambda key (for idle self-termination) and an HF token if there is one.
+    tar = subprocess.Popen(["tar", "--no-xattrs", "-C", str(REPO), "-cf", "-", "box"], stdout=subprocess.PIPE,
+                           env=dict(os.environ, COPYFILE_DISABLE="1"))
+    ssh(state, "rm -rf ~/llmchat-box && mkdir ~/llmchat-box && tar -xf - -C ~/llmchat-box --strip-components=1",
+        stdin=tar.stdout, check=True)
+    tar.wait()
+    if cfg["IDLE_MIN"] > 0:
+        ssh(state, "sudo install -d -m 700 /etc/llmchat && sudo tee /etc/llmchat/lambda-api-key >/dev/null"
+                   " && sudo chmod 600 /etc/llmchat/lambda-api-key", input=lambda_key().encode(), check=True)
+    hf_token = os.environ.get("HF_TOKEN") or (Path("~/.cache/huggingface/token").expanduser().read_text().strip()
+                                              if Path("~/.cache/huggingface/token").expanduser().exists() else "")
+    if hf_token:
+        ssh(state, "mkdir -p ~/.cache/huggingface && umask 077 && cat > ~/.cache/huggingface/token",
+            input=hf_token.encode(), check=True)
+
+    env = {"MODEL_REPO": cfg["MODEL_REPO"], "MODEL_REVISION": cfg["MODEL_REVISION"],
+           "SERVED_NAME": cfg["SERVED_NAME"], "VLLM_VERSION": cfg["VLLM_VERSION"],
+           "MAX_MODEL_LEN": cfg["MAX_MODEL_LEN"], "MAX_NUM_SEQS": cfg.get("MAX_NUM_SEQS", "128"),
+           "GPU_MEMORY_UTILIZATION": cfg["GPU_MEMORY_UTILIZATION"], "VLLM_ARGS": cfg.get("VLLM_ARGS", ""),
+           "TP": state.get("gpus", 1), "IDLE_MIN": cfg["IDLE_MIN"], "INSTANCE_ID": state["instance_id"]}
+    remote = "env " + " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items()) + " bash ~/llmchat-box/provision.sh"
+    print(f"Provisioning (vLLM + {cfg['MODEL_REPO']}); first run takes ~10 min ...", flush=True)
+    if ssh(state, remote).returncode != 0:
+        die("provisioning failed (output above). `llmchat logs` shows the vLLM log; `llmchat up` retries.")
+
+    served = json.loads(ssh(state, "cat ~/llmchat-served.json", capture_output=True, check=True, text=True).stdout)
+    state.update(served, served_name=cfg["SERVED_NAME"], model_revision=cfg["MODEL_REVISION"], ready=True,
+                 idle_min=cfg["IDLE_MIN"])
+    save_state(state)
+    print(f"\n{BOLD}Ready:{RESET} {cfg['MODEL_REPO']} @ {served['revision_sha'][:7]} on {state['instance_type']} "
+          f"(${state['price_cents_per_hour'] / 100:.2f}/hr)")
+    print("  llmchat ui      chat in the browser\n"
+          "  llmchat chat    chat in the terminal\n"
+          "  llmchat api     endpoint for scripts and eval harnesses\n"
+          "  llmchat down    terminate the box")
+    return state
+
+
+def ensure_box(cfg: dict) -> dict:
+    state = load_state()
+    if state and state.get("ready") and live_instance(state):
+        return state
+    print("No ready box; running `llmchat up` first.")
+    return cmd_up(cfg)
+
+
+def cmd_adopt(cfg: dict, args) -> None:
+    inst = lam("GET", f"/instances/{args.instance_id}")
+    it = inst["instance_type"]
+    save_state({"instance_id": inst["id"], "instance_type": it["name"], "region": inst["region"]["name"],
+                "price_cents_per_hour": it["price_cents_per_hour"], "gpus": it["specs"]["gpus"],
+                "launched_at": args.launched_at or now_iso(), "ip": inst.get("ip"), "model_repo": cfg["MODEL_REPO"],
+                "model_revision": cfg["MODEL_REVISION"], "served_name": cfg["SERVED_NAME"], "ready": False})
+    print(f"Adopted {inst['id']} ({it['name']}, {inst.get('ip')}). Run `llmchat up` to provision it.")
+
+
+def cmd_down(cfg: dict, args) -> None:
+    state = load_state()
+    tunnel_down(state)
+    webui_stop()
+    if not state:
+        print("No box recorded.")
+        return
+    inst = live_instance(state)
+    if inst:
+        lam("POST", "/instance-operations/terminate", {"instance_ids": [state["instance_id"]]})
+        print(f"Terminated {state['instance_id']} ({state['instance_type']}){cost_note(state)}.")
+    else:
+        print(f"Box {state['instance_id']} was already gone.")
+    STATE_FILE.unlink()
+    print(f"Transcripts and Open WebUI history stay in {cfg['DATA_DIR']}")
+
+
+def cost_note(state: dict) -> str:
+    try:
+        hours = (dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(state["launched_at"])).total_seconds() / 3600
+    except (KeyError, ValueError):
+        return ""
+    return f", up {int(hours)}h{int(hours % 1 * 60):02d}m, ~${hours * state['price_cents_per_hour'] / 100:.2f}"
+
+
+def cmd_status(cfg: dict, args) -> None:
+    state = load_state()
+    if not state:
+        print("No box. `llmchat up` starts one.")
+        return
+    inst = live_instance(state)
+    rev = (state.get("revision_sha") or "?")[:7]
+    print(f"model     {state['model_repo']} @ {rev}  (served as {state['served_name']})")
+    if not inst:
+        print(f"box       {state['instance_id']} is gone (terminated, possibly by the idle watchdog). `llmchat up` starts a new one.")
+        return
+    print(f"box       {state['instance_type']} {state['region']} {inst.get('ip')} {inst['status']}"
+          f"  ${state['price_cents_per_hour'] / 100:.2f}/hr{cost_note(state)}")
+    r = ssh(state, "curl -fs -m 5 -o /dev/null 127.0.0.1:8000/health && echo up || echo down;"
+                   " sudo cat /var/lib/llmchat/last_active 2>/dev/null || echo -;"
+                   " sudo test -e /var/lib/llmchat/keep && echo keep || echo nokeep;"
+                   " systemctl is-active llmchat-idle.timer", capture_output=True, text=True)
+    lines = (r.stdout.split() + ["?"] * 4)[:4]
+    print(f"vLLM      {lines[0]}")
+    if lines[3] != "active":
+        print("idle      auto-terminate off")
+    elif lines[2] == "keep":
+        print("idle      auto-terminate paused (llmchat keepalive off to resume)")
+    elif lines[1].isdigit():
+        idle = (time.time() - int(lines[1])) / 60
+        print(f"idle      {idle:.0f} min since last request; terminates at {state.get('idle_min', cfg['IDLE_MIN'])} (checked every 5 min)")
+    ui_up = http_ok(f"http://127.0.0.1:{cfg['UI_PORT']}/health")
+    keeper = "auto-reconnect on" if pid_alive(KEEPER_PID) else "auto-reconnect off"
+    print(f"tunnel    {'up' if tunnel_alive(state) else 'down'}, {keeper} (API http://127.0.0.1:{cfg['API_PORT']}/v1)")
+    print(f"web UI    {'running' if ui_up else 'stopped'} (http://localhost:{cfg['UI_PORT']})")
+
+
+def cmd_keepalive(cfg: dict, args) -> None:
+    state = ensure_box(cfg)
+    if args.mode == "on":
+        ssh(state, "sudo touch /var/lib/llmchat/keep", check=True)
+        print("Idle auto-terminate paused. The box bills until `llmchat down` or `llmchat keepalive off`.")
+    else:
+        ssh(state, "sudo rm -f /var/lib/llmchat/keep && date +%s | sudo tee /var/lib/llmchat/last_active >/dev/null",
+            check=True)
+        print(f"Idle auto-terminate back on ({state.get('idle_min', cfg['IDLE_MIN'])} min, timer restarted now).")
+
+
+def cmd_logs(cfg: dict, args) -> None:
+    state = load_state() or die("no box")
+    os.execvp("ssh", ["ssh", *ssh_opts(), "-t", f"ubuntu@{state['ip']}", "sudo journalctl -u vllm -n 200 -f"])
+
+
+def cmd_ssh(cfg: dict, args) -> None:
+    state = load_state() or die("no box")
+    os.execvp("ssh", ["ssh", *ssh_opts(), f"ubuntu@{state['ip']}", *args.cmd])
+
+
+def cmd_api(cfg: dict, args) -> None:
+    state = ensure_box(cfg)
+    tunnel_up(state, cfg)
+    base = f"http://127.0.0.1:{cfg['API_PORT']}/v1"
+    if args.env:
+        print(f"export OPENAI_BASE_URL={base}\nexport OPENAI_API_KEY=EMPTY\nexport LLMCHAT_MODEL={state['served_name']}")
+        return
+    print(f"base URL  {base}   (OpenAI-compatible; any API key works)\nmodel     {state['served_name']}\n")
+    print(f"""curl {base}/chat/completions -H 'Content-Type: application/json' -d '{{
+  "model": "{state['served_name']}",
+  "messages": [{{"role": "user", "content": "Hello"}}],
+  "chat_template_kwargs": {{"enable_thinking": false}}
+}}'""")
+
+
+def cmd_ui(cfg: dict, args) -> None:
+    state = ensure_box(cfg)
+    tunnel_up(state, cfg)
+    webui_start(cfg)
+    webui_configure(cfg, state)
+    url = f"http://localhost:{cfg['UI_PORT']}"
+    print(f"Open WebUI: {url}  (model: {state['served_name']})")
+    if not args.no_open:
+        subprocess.run(["open" if sys.platform == "darwin" else "xdg-open", url], capture_output=True)
+
+
+# ---------------------------------------------------------------- terminal chat
+
+CHAT_HELP = """commands:
+  /system TEXT     set the system prompt (/system shows it, /system off clears it)
+  /think on|off    reasoning on or off (on by default); /think low|medium|xhigh sets reasoning effort
+  /set KEY VALUE   sampling: temperature top_p top_k min_p max_tokens seed presence_penalty repetition_penalty
+                   (/set KEY default goes back to the model's default)
+  /params          show the current settings
+  /image PATH      attach an image to your next message
+  /file PATH       send a file's contents as your message
+  /retry           regenerate the last reply (the old one is kept in the transcript as discarded)
+  /undo            drop the last exchange
+  /new             start a new conversation (new transcript file)
+  /save            show where this conversation is saved (it saves after every turn)
+  /quit            exit (or Ctrl-D)
+  \"\"\"              start and end a multi-line message
+Ctrl-C stops a reply mid-stream."""
+
+FLOAT_PARAMS = {"temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"}
+INT_PARAMS = {"top_k", "max_tokens", "seed"}
+
+
+class Chat:
+    def __init__(self, cfg: dict, state: dict, args):
+        self.cfg, self.state = cfg, state
+        self.url = f"http://127.0.0.1:{cfg['API_PORT']}/v1/chat/completions"
+        self.model = state["served_name"]
+        self.meta = {k: state.get(k) for k in ("model_repo", "revision_sha", "served_name", "instance_type", "region",
+                                               "vllm_version", "generation_config")}
+        self.dir = Path(cfg["DATA_DIR"]) / state["served_name"] / "transcripts"
+        self.system = Path(args.system_file).read_text() if args.system_file else args.system
+        self.think = not args.no_think
+        self.effort: str | None = None
+        self.params: dict = {}
+        self.show_thinking = not args.hide_thinking
+        self.new()
+
+    def new(self) -> None:
+        self.turns: list[dict] = []
+        self.discarded: list[dict] = []
+        self.images: list[dict] = []
+        self.started = dt.datetime.now()
+        self.path = self.dir / f"{self.started:%Y-%m-%d_%H%M%S}.json"
+
+    def template_kwargs(self) -> dict:
+        kw: dict = {"enable_thinking": self.think}
+        if self.think and self.effort:
+            kw["reasoning_effort"] = self.effort
+        return kw
+
+    def api_messages(self) -> list[dict]:
+        msgs = [{"role": "system", "content": self.system}] if self.system else []
+        return msgs + [{"role": t["role"], "content": t.get("_api", t["content"])} for t in self.turns]
+
+    def save(self) -> None:
+        if not self.turns and not self.discarded:
+            return
+        self.dir.mkdir(parents=True, exist_ok=True)
+        clean = lambda ts: [{k: v for k, v in t.items() if not k.startswith("_")} for t in ts]  # noqa: E731
+        doc = {"meta": self.meta, "started_at": self.started.astimezone().isoformat(timespec="seconds"),
+               "updated_at": now_iso(), "system_prompt": self.system, "turns": clean(self.turns),
+               "discarded": clean(self.discarded)}
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+        tmp.replace(self.path)
+
+    def say(self, text: str) -> None:
+        turn: dict = {"role": "user", "content": text, "ts": now_iso()}
+        if self.images:
+            turn["images"] = [{"path": i["path"], "sha256": i["sha256"]} for i in self.images]
+            turn["_api"] = [{"type": "text", "text": text}] + [
+                {"type": "image_url", "image_url": {"url": i["url"]}} for i in self.images]
+            self.images = []
+        self.turns.append(turn)
+        if not self.generate():
+            self.turns.pop()
+
+    def generate(self) -> bool:
+        body = {"model": self.model, "messages": self.api_messages(), "stream": True,
+                "stream_options": {"include_usage": True}, "chat_template_kwargs": self.template_kwargs(), **self.params}
+        req = urllib.request.Request(self.url, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        reasoning, content, usage, finish, interrupted, mode = [], [], None, None, False, None
+        held = ""  # trailing whitespace of the reasoning, not printed so the answer doesn't start after a gap
+        try:
+            try:
+                resp = urllib.request.urlopen(req, timeout=900)
+            except urllib.error.URLError as e:
+                if isinstance(e, urllib.error.HTTPError):
+                    raise
+                open_tunnel(self.state, self.cfg)  # the tunnel dropped (sleep, network change): reopen and retry once
+                resp = urllib.request.urlopen(req, timeout=900)
+            with resp as r:
+                for raw in r:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    ev = json.loads(data)
+                    usage = ev.get("usage") or usage
+                    for ch in ev.get("choices", []):
+                        d = ch.get("delta") or {}
+                        r_piece = d.get("reasoning") or d.get("reasoning_content")
+                        if r_piece:
+                            reasoning.append(r_piece)
+                            if self.show_thinking:
+                                if mode != "r":
+                                    print(f"{DIM}[thinking] ", end="")
+                                    mode = "r"
+                                text = held + r_piece
+                                held = text[len(text.rstrip()):]
+                                print(text.rstrip(), end="", flush=True)
+                        if d.get("content"):
+                            content.append(d["content"])  # saved verbatim; only the display is trimmed
+                            shown = d["content"] if mode == "c" else d["content"].lstrip()
+                            if shown:
+                                if mode != "c":
+                                    print(f"{RESET}\n\n{CYAN}" if mode == "r" else CYAN, end="")
+                                    mode = "c"
+                                print(shown, end="", flush=True)
+                        finish = ch.get("finish_reason") or finish
+        except KeyboardInterrupt:
+            interrupted = True
+        except urllib.error.HTTPError as e:
+            print(f"{RESET}\n{RED}server error {e.code}:{RESET} {e.read().decode(errors='replace')[:500]}")
+            return False
+        except (urllib.error.URLError, OSError, RuntimeError, http.client.HTTPException) as e:
+            if not content and not reasoning:
+                print(f"{RESET}\n{RED}can't reach the model ({e}).{RESET} The box may be gone: try `llmchat status`.")
+                return False
+            print(f"{RESET}\n{RED}connection lost mid-reply ({e}); keeping the partial reply.{RESET}")
+            finish = "connection_lost"
+        print(RESET)
+        self.turns.append({"role": "assistant", "content": "".join(content), "reasoning": "".join(reasoning) or None,
+                           "ts": now_iso(), "finish_reason": "interrupted" if interrupted else finish,
+                           "usage": usage, "request": {"system_prompt": self.system, "sampling": dict(self.params),
+                                                       "chat_template_kwargs": self.template_kwargs()}})
+        if usage:
+            print(f"{DIM}[{usage.get('prompt_tokens')} in / {usage.get('completion_tokens')} out"
+                  f"{', ' + finish if finish and finish != 'stop' else ''}{', interrupted' if interrupted else ''}]{RESET}")
+        self.save()
+        return True
+
+    def describe(self) -> str:
+        gen = self.meta.get("generation_config") or {}
+        defaults = {k: gen[k] for k in ("temperature", "top_p", "top_k") if k in gen}
+        return (f"model {self.model} @ {(self.meta.get('revision_sha') or '?')[:7]}\n"
+                f"thinking {'on' if self.think else 'off'}{' (' + self.effort + ')' if self.think and self.effort else ''}"
+                f" | sampling {self.params or 'model defaults'} | model defaults {defaults}\n"
+                f"system prompt: {self.system!r}\ntranscript: {self.path}")
+
+    def command(self, line: str) -> bool:
+        cmd, _, arg = line.partition(" ")
+        arg = arg.strip()
+        if cmd in ("/quit", "/exit", "/q"):
+            return False
+        if cmd == "/help":
+            print(CHAT_HELP)
+        elif cmd == "/system":
+            if not arg:
+                print(f"system prompt: {self.system!r}")
+            else:
+                self.system = None if arg == "off" else arg
+                print("system prompt cleared" if self.system is None else "system prompt set")
+        elif cmd == "/think":
+            if arg in ("on", "off"):
+                self.think = arg == "on"
+            elif arg and " " not in arg:
+                self.think, self.effort = True, arg
+            else:
+                print("usage: /think on|off, or /think EFFORT (e.g. low, medium, xhigh) to set reasoning_effort")
+            print(f"thinking {'on' if self.think else 'off'}{' (' + self.effort + ')' if self.think and self.effort else ''}")
+        elif cmd == "/set":
+            key, _, val = arg.partition(" ")
+            val = val.strip()
+            if key not in FLOAT_PARAMS | INT_PARAMS or not val:
+                print(f"usage: /set KEY VALUE with KEY in {sorted(FLOAT_PARAMS | INT_PARAMS)}")
+            elif val == "default":
+                self.params.pop(key, None)
+            else:
+                try:
+                    self.params[key] = float(val) if key in FLOAT_PARAMS else int(val)
+                except ValueError:
+                    print(f"bad value {val!r}")
+            print(f"sampling {self.params or 'model defaults'}")
+        elif cmd == "/params":
+            print(self.describe())
+        elif cmd == "/image":
+            p = Path(arg).expanduser()
+            if not p.is_file():
+                print(f"no such file: {p}")
+            else:
+                raw = p.read_bytes()
+                mime = mimetypes.guess_type(p.name)[0] or "image/png"
+                self.images.append({"path": str(p.resolve()), "sha256": hashlib.sha256(raw).hexdigest(),
+                                    "url": f"data:{mime};base64,{base64.b64encode(raw).decode()}"})
+                print(f"attached {p.name} to your next message ({len(self.images)} queued)")
+        elif cmd == "/file":
+            p = Path(arg).expanduser()
+            if p.is_file():
+                self.say(p.read_text())
+            else:
+                print(f"no such file: {p}")
+        elif cmd == "/retry":
+            if self.turns and self.turns[-1]["role"] == "assistant":
+                self.discarded.append(dict(self.turns.pop(), discarded="retry"))
+                self.generate()
+            else:
+                print("nothing to retry")
+        elif cmd == "/undo":
+            while self.turns:
+                t = self.turns.pop()
+                self.discarded.append(dict(t, discarded="undo"))
+                if t["role"] == "user":
+                    break
+            self.save()
+            print(f"{len(self.turns)} messages left")
+        elif cmd == "/new":
+            self.save()
+            self.new()
+            print(f"new conversation -> {self.path}")
+        elif cmd == "/save":
+            self.save()
+            print(self.path if self.path.exists() else "(nothing to save yet)")
+        else:
+            print(f"unknown command {cmd}; /help lists them")
+        return True
+
+    def read(self) -> str:
+        line = input(f"{BOLD}you>{RESET} ").strip()
+        if not line.startswith('"""'):
+            return line
+        rest = line[3:]
+        if len(rest) >= 3 and rest.endswith('"""'):  # """one line"""
+            return rest[:-3].strip()
+        buf = [rest] if rest else []
+        while True:
+            nxt = input("... ")
+            if nxt.rstrip().endswith('"""'):
+                buf.append(nxt.rstrip()[:-3])
+                return "\n".join(buf).strip()
+            buf.append(nxt)
+
+    def loop(self) -> None:
+        try:
+            import readline  # noqa: F401  (line editing and history)
+            hist = STATE_DIR / "chat_history"
+            try:
+                readline.read_history_file(hist)
+            except OSError:
+                pass
+            import atexit
+            atexit.register(readline.write_history_file, hist)
+        except ImportError:
+            pass
+        print(f"{self.describe()}\n/help for commands\n")
+        while True:
+            try:
+                text = self.read()
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print()
+                continue
+            if not text:
+                continue
+            if text.startswith("/"):
+                if not self.command(text):
+                    break
+            else:
+                self.say(text)
+        self.save()
+        if self.path.exists():
+            print(f"saved {self.path}")
+
+
+def cmd_chat(cfg: dict, args) -> None:
+    state = ensure_box(cfg)
+    tunnel_up(state, cfg)
+    if not http_ok(f"http://127.0.0.1:{cfg['API_PORT']}/health", timeout=10):
+        die("the tunnel is up but vLLM is not answering; check `llmchat logs`")
+    Chat(cfg, state, args).loop()
+
+
+# ---------------------------------------------------------------- main
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="llmchat", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("up", help="launch and provision a box (reuses a running one)").set_defaults(fn=cmd_up)
+    p = sub.add_parser("ui", help="open the local Open WebUI")
+    p.add_argument("--no-open", action="store_true", help="don't open the browser")
+    p.set_defaults(fn=cmd_ui)
+    p = sub.add_parser("chat", help="terminal chat (transcripts saved as JSON)")
+    p.add_argument("--system", help="system prompt")
+    p.add_argument("--system-file", help="read the system prompt from a file")
+    p.add_argument("--no-think", action="store_true", help="start with reasoning off")
+    p.add_argument("--hide-thinking", action="store_true", help="don't print reasoning (it is still saved)")
+    p.set_defaults(fn=cmd_chat)
+    p = sub.add_parser("api", help="open the tunnel and print the endpoint")
+    p.add_argument("--env", action="store_true", help="print export lines: eval \"$(llmchat api --env)\"")
+    p.set_defaults(fn=cmd_api)
+    sub.add_parser("status", help="box, cost, idle timer, tunnel, UI").set_defaults(fn=cmd_status)
+    p = sub.add_parser("keepalive", help="pause (on) or resume (off) idle auto-terminate")
+    p.add_argument("mode", choices=["on", "off"])
+    p.set_defaults(fn=cmd_keepalive)
+    sub.add_parser("logs", help="follow the vLLM log").set_defaults(fn=cmd_logs)
+    p = sub.add_parser("ssh", help="ssh to the box")
+    p.add_argument("cmd", nargs=argparse.REMAINDER)
+    p.set_defaults(fn=cmd_ssh)
+    sub.add_parser("down", help="terminate the box, stop tunnel and UI").set_defaults(fn=cmd_down)
+    sub.add_parser("_keep-tunnel").set_defaults(fn=cmd_keep_tunnel)  # internal: background tunnel keeper
+    p = sub.add_parser("adopt", help="manage an existing Lambda instance")
+    p.add_argument("instance_id")
+    p.add_argument("--launched-at", help="ISO time the box was launched (for cost estimates)")
+    p.set_defaults(fn=cmd_adopt)
+    args = ap.parse_args()
+    try:
+        args.fn(load_config(), args)
+    except LambdaError as e:
+        die(str(e))
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
