@@ -356,7 +356,9 @@ def tunnel_up(state: dict, cfg: dict) -> None:
     with lock("keeper"):
         if not pid_alive(KEEPER_PID, "_keep-tunnel"):
             log = open(STATE_DIR / "tunnel-keeper.log", "a")
-            p = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_keep-tunnel"],
+            # Not uv's throwaway interpreter (see cmd_chat): the keeper outlives the command that starts it.
+            python = os.environ.get("LAMBDACHAT_PYTHON") or sys.executable
+            p = subprocess.Popen([python, str(Path(__file__).resolve()), "_keep-tunnel"],
                                  stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
             KEEPER_PID.write_text(str(p.pid))
 
@@ -1090,6 +1092,7 @@ def cmd_chat(cfg: dict, args) -> None:
         except ImportError:
             if shutil.which("uv"):  # rerun with prompt_toolkit available (cached by uv after the first time)
                 os.environ["LAMBDACHAT_REEXEC"] = "1"
+                os.environ["LAMBDACHAT_PYTHON"] = sys.executable
                 os.execvp("uv", ["uv", "run", "--quiet", "--no-project", "--with", "prompt_toolkit>=3.0.40", "python",
                                  str(Path(__file__).resolve()), *sys.argv[1:]])
     state = ensure_box(cfg)
