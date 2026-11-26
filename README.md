@@ -1,7 +1,7 @@
 # lambda-vllm-chat
 
 Serve a Hugging Face model with vLLM on a Lambda Cloud GPU box and chat with it from your laptop, either in a browser
-(Open WebUI) or in the terminal. Every conversation is saved locally. The box terminates itself after it has been idle for 2 hours.
+(Open WebUI) or in the terminal. Conversations are not saved anywhere. The box terminates itself after an hour with no requests.
 
 The default model is [huihui-ai/Huihui-Qwen3.8-27B-abliterated](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
 (bf16, ~56 GB), which runs on a single 80 GB GPU (H100 at $3.79/hr when this was written).
@@ -17,7 +17,8 @@ You need:
 
 - A Lambda Cloud API key, in `~/.config/lambda/api-key` or `$LAMBDA_API_KEY`.
 - An SSH key in `~/.ssh` (`id_ed25519`, `id_ecdsa` or `id_rsa`). If Lambda doesn't have it yet, it is uploaded on the first `up`.
-- Python 3.9+ (standard library only) and [uv](https://docs.astral.sh/uv/). uv installs Open WebUI on the first `lambdachat ui`.
+- Python 3.9+ (standard library only) and [uv](https://docs.astral.sh/uv/). uv installs Open WebUI on the first
+  `lambdachat ui`, and provides prompt_toolkit for the terminal chat's input.
 - For gated models, a Hugging Face token in `$HF_TOKEN` or `~/.cache/huggingface/token`.
 
 ## Use
@@ -35,14 +36,14 @@ automatically when no box is running.
 | Command | What it does |
 |---|---|
 | `lambdachat up` | Launch the cheapest Lambda box with capacity that fits the model, install vLLM, download the model, start serving. If a box is already running, it is re-provisioned in place (safe to re-run). |
-| `lambdachat ui [--no-open]` | Start Open WebUI locally and open it. Chats are stored on your machine, so they survive the box being terminated. |
-| `lambdachat chat` | Terminal chat. `/help` lists commands (system prompt, thinking on/off, sampling, images, retry, undo). |
+| `lambdachat ui [--no-open]` | Start Open WebUI locally and open it. Chats are temporary and the UI's data is wiped when it stops (see below). |
+| `lambdachat chat` | Terminal chat, kept in memory only. Pasted multi-line text stays one message until you press Enter (Esc then Enter adds a line). `/help` lists commands (system prompt, thinking on/off, sampling, images, retry, undo). |
 | `lambdachat api [--env]` | Open the tunnel and print the OpenAI-compatible endpoint. `eval "$(lambdachat api --env)"` exports `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `LAMBDACHAT_MODEL` (it needs a running box and never launches one). |
 | `lambdachat status` | Model and revision, instance, cost so far, minutes idle, tunnel, UI. |
 | `lambdachat keepalive on\|off` | Pause or resume idle auto-terminate. |
 | `lambdachat logs` | Follow the vLLM log on the box. |
 | `lambdachat ssh [cmd]` | Shell on the box. |
-| `lambdachat down` | Terminate the box and stop the tunnel and the local UI. Transcripts and UI history stay. |
+| `lambdachat down` | Terminate the box, stop the tunnel and the local UI, and delete the UI's session data. |
 | `lambdachat adopt ID` | Take over a Lambda instance launched some other way; then `lambdachat up` provisions it. |
 
 ## Thinking mode
@@ -70,25 +71,23 @@ print(r.choices[0].message.content)
 If you don't set sampling parameters, the model's own defaults from `generation_config.json` apply (temperature 1.0,
 top_p 0.95, top_k 20 for this model).
 
-## Transcripts
+## Nothing is saved
 
-`lambdachat chat` writes each conversation to `~/LLM-Chat/<model>/transcripts/<date>_<time>.json` after every turn. Each file records:
-
-- `meta`: model repo, exact commit sha, instance type, vLLM version, the model's default sampling
-- `system_prompt`
-- `turns`: each message with timestamp. Assistant turns also record their reasoning, usage, finish reason, the
-  request settings used (system prompt, sampling, chat template kwargs), and the box and model commit that answered.
-- `discarded`: replies dropped with `/retry` or `/undo`
-
-Open WebUI keeps its own history in `~/LLM-Chat/open-webui/` and can export chats as JSON.
+- **Terminal chat**: the conversation exists only in the `lambdachat chat` process. Nothing is written to disk, including
+  your input history, and it is gone when you quit.
+- **Open WebUI**: new chats are temporary, so they are never written to its database. The UI's whole data directory
+  (`~/.config/lambda-vllm-chat/webui-session`) is deleted whenever the UI starts or stops, and `lambdachat down` stops it.
+  This also removes chats you made permanent by turning temporary mode off, uploads and logs. Only the helper models it
+  downloads (embeddings, tokenizer) are kept, in `webui-cache`.
+- **The box**: vLLM doesn't log prompts or replies, and the box's disk is erased when it terminates.
+- **API**: whatever your own scripts record is up to them.
 
 ## Cost and auto-shutdown
 
 The box bills by the minute until it is terminated. A systemd timer on the box checks vLLM every 5 minutes. After
-`IDLE_MIN` minutes (default 120) with no requests, the box terminates itself through the Lambda API.
+`IDLE_MIN` minutes (default 60) with no requests, the box terminates itself through the Lambda API.
 `lambdachat status` shows the idle time. Pause the timer with `lambdachat keepalive on` and resume it with `keepalive off`.
-Nothing is lost when the box goes away: transcripts and Open WebUI data are on your machine. The next `ui`/`chat`/`up` starts a
-fresh box.
+The next `ui`/`chat`/`up` starts a fresh box.
 
 ## Configuration
 
@@ -103,8 +102,7 @@ LAMBDACHAT_IDLE_MIN=0 lambdachat up                                             
 
 To serve a different model, set `MODEL_REPO` (and `MIN_VRAM_GB` if it needs more or less memory). Switching models or
 revisions needs `lambdachat down` first. Running two boxes at once needs a separate state directory
-(`LAMBDACHAT_STATE_DIR=~/.config/lambda-vllm-chat-2`), with its own `config.env` there setting `API_PORT`, `UI_PORT` and
-`DATA_DIR`.
+(`LAMBDACHAT_STATE_DIR=~/.config/lambda-vllm-chat-2`), with its own `config.env` there setting `API_PORT` and `UI_PORT`.
 
 ## How it works
 
@@ -136,4 +134,4 @@ revisions needs `lambdachat down` first. Running two boxes at once needs a separ
 - Hybrid linear-attention models like Qwen3.8 need `--max-num-seqs` at or below the number of cache blocks that fit.
   `MAX_NUM_SEQS=128` works on 80 GB. vLLM's default of 1024 fails at startup.
 - "no capacity right now": Lambda has no fitting GPU free. Retry later, or widen `INSTANCE_TYPES`, `MAX_GPUS` or `MIN_VRAM_GB`.
-- Logs on your machine: `~/.config/lambda-vllm-chat/tunnel-keeper.log` and `~/LLM-Chat/open-webui/webui.log`.
+- Logs on your machine: `~/.config/lambda-vllm-chat/tunnel-keeper.log`, and `webui-session/webui.log` there while the UI runs.

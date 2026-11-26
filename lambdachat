@@ -3,7 +3,7 @@
 
   lambdachat up                 launch a box (cheapest that fits) and serve the model; reuses a running box
   lambdachat ui                 Open WebUI in the browser (local, http://localhost:13000); runs `up` first if needed
-  lambdachat chat               terminal chat; every conversation is saved as JSON
+  lambdachat chat               terminal chat (nothing is saved)
   lambdachat api [--env]        open the tunnel and print the OpenAI-compatible endpoint for scripts and eval harnesses
   lambdachat status             box, model, cost so far, idle timer, tunnel and UI
   lambdachat keepalive on|off   pause or resume the box's idle auto-terminate
@@ -23,7 +23,6 @@ import base64
 import contextlib
 import datetime as dt
 import fcntl
-import hashlib
 import http.client
 import json
 import mimetypes
@@ -47,6 +46,8 @@ TUNNEL_SOCK = STATE_DIR / "tunnel.sock"
 WEBUI_PID = STATE_DIR / "webui.pid"
 KEEPER_PID = STATE_DIR / "tunnel-keeper.pid"
 KNOWN_HOSTS = STATE_DIR / "known_hosts"
+WEBUI_SESSION = STATE_DIR / "webui-session"  # Open WebUI's data dir: wiped whenever the UI starts or stops
+WEBUI_CACHE = STATE_DIR / "webui-cache"  # downloaded helper models only (embeddings, tokenizer), kept across sessions
 LAMBDA_API = "https://cloud.lambda.com/api/v1"
 UA = "lambda-vllm-chat"  # Lambda's edge rejects the default Python-urllib user agent
 ALIVE = ("booting", "active", "unhealthy")
@@ -99,8 +100,6 @@ def load_config() -> dict:
         if k.startswith("LAMBDACHAT_") and k != "LAMBDACHAT_STATE_DIR":
             cfg[k[len("LAMBDACHAT_"):]] = v
     cfg["SERVED_NAME"] = cfg.get("SERVED_NAME") or cfg["MODEL_REPO"].split("/")[-1].lower()
-    cfg["DATA_DIR"] = str(Path(cfg.get("DATA_DIR") or "~/LLM-Chat").expanduser())
-    Path(cfg["DATA_DIR"]).mkdir(mode=0o700, parents=True, exist_ok=True)  # transcripts: readable only by you
     for k in ("API_PORT", "UI_PORT", "IDLE_MIN", "MIN_VRAM_GB", "MAX_GPUS"):
         cfg[k] = int(cfg[k])
     return cfg
@@ -436,10 +435,21 @@ def webui_env(cfg: dict, data: Path) -> dict:
     )
 
 
+def webui_fresh_dir() -> Path:
+    """An empty data dir for this UI session, so no chat history survives it. Only the downloaded helper models are
+    linked in from a persistent cache (not audio caches, which can hold spoken messages)."""
+    shutil.rmtree(WEBUI_SESSION, ignore_errors=True)
+    (WEBUI_SESSION / "cache").mkdir(mode=0o700, parents=True)
+    for sub in ("embedding", "tiktoken"):
+        (WEBUI_CACHE / sub).mkdir(parents=True, exist_ok=True)
+        (WEBUI_SESSION / "cache" / sub).symlink_to(WEBUI_CACHE / sub)
+    return WEBUI_SESSION
+
+
 def webui_start(cfg: dict) -> None:
     port = cfg["UI_PORT"]
     health = f"http://127.0.0.1:{port}/health"
-    data = Path(cfg["DATA_DIR"]) / "open-webui"
+    data = WEBUI_SESSION
     with lock("webui"):
         if http_ok(health):
             return
@@ -453,7 +463,7 @@ def webui_start(cfg: dict) -> None:
                 exe = shutil.which("open-webui") or str(Path("~/.local/bin/open-webui").expanduser())
             if port_open(port):
                 die(f"local port {port} is in use by something other than Open WebUI; set UI_PORT")
-            data.mkdir(parents=True, exist_ok=True)
+            data = webui_fresh_dir()
             log = open(data / "webui.log", "ab")
             p = subprocess.Popen([exe, "serve", "--host", "127.0.0.1", "--port", str(port)], cwd=data,
                                  env=webui_env(cfg, data), stdin=subprocess.DEVNULL, stdout=log, stderr=log,
@@ -492,6 +502,9 @@ def webui_configure(cfg: dict, state: dict) -> None:
         print(f"(could not configure Open WebUI: sign-in returned {status})")
         return
     token, name = auth["token"], state["served_name"]
+    # New chats are temporary (never written to the database); no "what's new" popup on each fresh start.
+    webui_api(cfg, "POST", "/api/v1/users/user/settings/update",
+              {"ui": {"temporaryChatByDefault": True, "showChangelog": False}}, token)
     kwargs = state.get("template_kwargs") or []
     params: dict = {}
     if "enable_thinking" in kwargs:
@@ -518,11 +531,17 @@ def webui_configure(cfg: dict, state: dict) -> None:
 
 
 def webui_stop() -> None:
+    """Stop Open WebUI and delete its data dir (any chats, uploads and logs from the session)."""
     pid = pid_alive(WEBUI_PID, "open-webui")
     if pid:
         with contextlib.suppress(OSError):
             os.killpg(pid, signal.SIGTERM)
+        for _ in range(50):
+            if not pid_alive(WEBUI_PID, "open-webui"):
+                break
+            time.sleep(0.2)
     WEBUI_PID.unlink(missing_ok=True)
+    shutil.rmtree(WEBUI_SESSION, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- commands: box lifecycle
@@ -662,7 +681,7 @@ def cmd_down(cfg: dict, args) -> None:
         else:
             print(f"Box {state['instance_id']} was already gone.")
         STATE_FILE.unlink(missing_ok=True)
-    print(f"Transcripts and Open WebUI history stay in {cfg['DATA_DIR']}")
+    print("Open WebUI stopped and its session data deleted.")
 
 
 def cmd_status(cfg: dict, args) -> None:
@@ -773,17 +792,17 @@ CHAT_HELP = """commands:
   /params          show the current settings
   /image PATH      attach an image to your next message
   /file PATH       send a file's contents as your message
-  /retry           regenerate the last reply (the old one is kept in the transcript as discarded)
+  /retry           regenerate the last reply
   /undo            drop the last exchange
-  /new             start a new conversation (new transcript file)
-  /save            show where this conversation is saved (it saves after every turn)
+  /new             start a new conversation
   /quit            exit (or Ctrl-D)
+Paste multi-line text normally: it stays one message until you press Enter. Esc then Enter adds a new line.
+Nothing is saved: the conversation exists only in this window and is gone when you quit.
   \"\"\"              on a line by itself: start or end a multi-line message
 Ctrl-C stops a reply mid-stream."""
 
 FLOAT_PARAMS = {"temperature", "top_p", "min_p", "presence_penalty", "frequency_penalty", "repetition_penalty"}
 INT_PARAMS = {"top_k", "max_tokens", "seed"}
-BOX_KEYS = ("instance_id", "revision_sha", "instance_type")
 
 
 def user_path(arg: str) -> Path:
@@ -800,9 +819,7 @@ class Chat:
         self.cfg, self.state = cfg, state
         self.url = f"http://127.0.0.1:{cfg['API_PORT']}/v1/chat/completions"
         self.model = state["served_name"]
-        self.meta = {k: state.get(k) for k in ("model_repo", "revision_sha", "served_name", "instance_id",
-                                               "instance_type", "region", "vllm_version", "generation_config")}
-        self.dir = Path(cfg["DATA_DIR"]) / state["served_name"] / "transcripts"
+        self.meta = {k: state.get(k) for k in ("revision_sha", "generation_config")}
         self.system = Path(args.system_file).read_text() if args.system_file else args.system
         self.think = not args.no_think
         self.effort: str | None = None
@@ -811,16 +828,8 @@ class Chat:
         self.new()
 
     def new(self) -> None:
-        self.turns: list[dict] = []
-        self.discarded: list[dict] = []
+        self.turns: list[dict] = []  # in memory only
         self.images: list[dict] = []
-        self.started = dt.datetime.now()
-        stem = f"{self.started:%Y-%m-%d_%H%M%S}"
-        self.path = self.dir / f"{stem}.json"
-        n = 1
-        while self.path.exists():  # two chats started in the same second
-            n += 1
-            self.path = self.dir / f"{stem}-{n}.json"
 
     def template_kwargs(self) -> dict:
         kw: dict = {"enable_thinking": self.think}
@@ -832,23 +841,10 @@ class Chat:
         msgs = [{"role": "system", "content": self.system}] if self.system else []
         return msgs + [{"role": t["role"], "content": t.get("_api", t["content"])} for t in self.turns]
 
-    def save(self) -> None:
-        if not self.turns and not self.discarded:
-            return
-        self.dir.mkdir(parents=True, exist_ok=True)
-        clean = lambda ts: [{k: v for k, v in t.items() if not k.startswith("_")} for t in ts]  # noqa: E731
-        doc = {"meta": self.meta, "started_at": self.started.astimezone().isoformat(timespec="seconds"),
-               "updated_at": now_iso(), "system_prompt": self.system, "turns": clean(self.turns),
-               "discarded": clean(self.discarded)}
-        tmp = self.path.with_suffix(f".tmp{os.getpid()}")
-        tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
-        tmp.replace(self.path)
-
     def say(self, text: str) -> None:
-        turn: dict = {"role": "user", "content": text, "ts": now_iso()}
+        turn: dict = {"role": "user", "content": text}
         images = self.images
         if images:
-            turn["images"] = [{"path": i["path"], "sha256": i["sha256"]} for i in images]
             turn["_api"] = [{"type": "text", "text": text}] + [
                 {"type": "image_url", "image_url": {"url": i["url"]}} for i in images]
             self.images = []
@@ -858,7 +854,7 @@ class Chat:
             self.images = images  # keep them queued for the next try
 
     def refresh_box(self) -> None:
-        """Follow the box if it was replaced (e.g. auto-terminated and relaunched) and say so in the transcript."""
+        """Follow the box if it was replaced (e.g. auto-terminated and relaunched)."""
         state = load_state()
         if state and state.get("ip") and state.get("instance_id") != self.state.get("instance_id"):
             self.state = state
@@ -937,18 +933,10 @@ class Chat:
                 return False
             finish = "error"
         print(RESET)
-        turn = {"role": "assistant", "content": "".join(content), "reasoning": "".join(reasoning) or None,
-                "ts": now_iso(), "finish_reason": "interrupted" if interrupted else finish, "usage": usage,
-                "request": {"system_prompt": self.system, "sampling": dict(self.params),
-                            "chat_template_kwargs": self.template_kwargs()},
-                "box": {k: self.state.get(k) for k in BOX_KEYS}}
-        if error:
-            turn["error"] = error
-        self.turns.append(turn)
+        self.turns.append({"role": "assistant", "content": "".join(content)})
         if usage:
             print(f"{DIM}[{usage.get('prompt_tokens')} in / {usage.get('completion_tokens')} out"
                   f"{', ' + finish if finish and finish != 'stop' else ''}{', interrupted' if interrupted else ''}]{RESET}")
-        self.save()
         return True
 
     def describe(self) -> str:
@@ -957,7 +945,7 @@ class Chat:
         return (f"model {self.model} @ {(self.meta.get('revision_sha') or '?')[:7]}\n"
                 f"thinking {'on' if self.think else 'off'}{' (' + self.effort + ')' if self.think and self.effort else ''}"
                 f" | sampling {self.params or 'model defaults'} | model defaults {defaults}\n"
-                f"system prompt: {self.system!r}\ntranscript: {self.path}")
+                f"system prompt: {self.system!r}\nnothing is saved; the conversation is gone when you quit")
 
     def command(self, line: str) -> bool:
         cmd, _, arg = line.partition(" ")
@@ -1003,8 +991,7 @@ class Chat:
                 print(f"can't read {p}: {e}")
             else:
                 mime = mimetypes.guess_type(p.name)[0] or "image/png"
-                self.images.append({"path": str(p.resolve()), "sha256": hashlib.sha256(raw).hexdigest(),
-                                    "url": f"data:{mime};base64,{base64.b64encode(raw).decode()}"})
+                self.images.append({"url": f"data:{mime};base64,{base64.b64encode(raw).decode()}"})
                 print(f"attached {p.name} to your next message ({len(self.images)} queued)")
         elif cmd == "/file":
             p = user_path(arg)
@@ -1017,40 +1004,30 @@ class Chat:
         elif cmd == "/retry":
             if self.turns and self.turns[-1]["role"] == "assistant":
                 old = self.turns.pop()
-                if self.generate():
-                    self.discarded.append(dict(old, discarded="retry"))
-                    self.save()
-                else:
+                if not self.generate():
                     self.turns.append(old)  # the retry failed: keep the old reply
             else:
                 print("nothing to retry")
         elif cmd == "/undo":
             while self.turns:
-                t = self.turns.pop()
-                self.discarded.append(dict(t, discarded="undo"))
-                if t["role"] == "user":
+                if self.turns.pop()["role"] == "user":
                     break
-            self.save()
             print(f"{len(self.turns)} messages left")
         elif cmd == "/new":
-            self.save()
             self.new()
-            print(f"new conversation -> {self.path}")
-        elif cmd == "/save":
-            self.save()
-            print(self.path if self.path.exists() else "(nothing to save yet)")
+            print("new conversation")
         else:
             print(f"unknown command {cmd}; /help lists them")
         return True
 
     def read(self) -> str:
-        line = input(f"{BOLD}you>{RESET} ")
+        line = self.prompt(f"{BOLD}you>{RESET} ")
         if line.strip() != '"""':
             return line.strip()
         buf: list[str] = []
         while True:
             try:
-                nxt = input("... ")
+                nxt = self.prompt("... ")
             except EOFError:
                 break  # Ctrl-D inside a block sends what was typed
             if nxt.strip() == '"""':
@@ -1058,16 +1035,32 @@ class Chat:
             buf.append(nxt)
         return "\n".join(buf).strip()
 
+    def make_prompt(self):
+        """prompt_toolkit when on a terminal: a pasted block (bracketed paste) stays one message, with normal line
+        editing. macOS's built-in editline treats every pasted newline as Enter and splits a paste into many messages."""
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            try:
+                from prompt_toolkit import PromptSession
+                from prompt_toolkit.formatted_text import ANSI
+                from prompt_toolkit.history import InMemoryHistory
+                from prompt_toolkit.key_binding import KeyBindings
+            except ImportError:
+                pass
+            else:
+                kb = KeyBindings()
+
+                @kb.add("escape", "enter")
+                def _newline(event):
+                    event.current_buffer.insert_text("\n")
+
+                session = PromptSession(history=InMemoryHistory(), key_bindings=kb)  # history never touches disk
+                return lambda text: session.prompt(ANSI(text), multiline=False, prompt_continuation="... ")
+        with contextlib.suppress(ImportError):
+            import readline  # noqa: F401  (line editing; history stays in memory)
+        return input
+
     def loop(self) -> None:
-        try:
-            import readline  # noqa: F401  (line editing and history)
-            hist = STATE_DIR / "chat_history"
-            with contextlib.suppress(OSError):
-                readline.read_history_file(hist)
-            import atexit
-            atexit.register(readline.write_history_file, hist)
-        except ImportError:
-            pass
+        self.prompt = self.make_prompt()
         print(f"{self.describe()}\n/help for commands\n")
         while True:
             try:
@@ -1088,13 +1081,17 @@ class Chat:
                     self.say(text)
             except Exception as e:  # noqa: BLE001  (never lose the session to one bad command)
                 print(f"{RED}error: {type(e).__name__}: {e}{RESET}")
-                self.save()
-        self.save()
-        if self.path.exists():
-            print(f"saved {self.path}")
 
 
 def cmd_chat(cfg: dict, args) -> None:
+    if sys.stdin.isatty() and not os.environ.get("LAMBDACHAT_REEXEC"):
+        try:
+            import prompt_toolkit  # noqa: F401
+        except ImportError:
+            if shutil.which("uv"):  # rerun with prompt_toolkit available (cached by uv after the first time)
+                os.environ["LAMBDACHAT_REEXEC"] = "1"
+                os.execvp("uv", ["uv", "run", "--quiet", "--no-project", "--with", "prompt_toolkit>=3.0.40", "python",
+                                 str(Path(__file__).resolve()), *sys.argv[1:]])
     state = ensure_box(cfg)
     tunnel_up(state, cfg)
     if not http_ok(f"http://127.0.0.1:{cfg['API_PORT']}/health", timeout=10):
@@ -1112,11 +1109,11 @@ def main() -> None:
     p = sub.add_parser("ui", help="open the local Open WebUI")
     p.add_argument("--no-open", action="store_true", help="don't open the browser")
     p.set_defaults(fn=cmd_ui)
-    p = sub.add_parser("chat", help="terminal chat (transcripts saved as JSON)")
+    p = sub.add_parser("chat", help="terminal chat (nothing is saved)")
     p.add_argument("--system", help="system prompt")
     p.add_argument("--system-file", help="read the system prompt from a file")
     p.add_argument("--no-think", action="store_true", help="start with reasoning off")
-    p.add_argument("--hide-thinking", action="store_true", help="don't print reasoning (it is still saved)")
+    p.add_argument("--hide-thinking", action="store_true", help="don't print the reasoning")
     p.set_defaults(fn=cmd_chat)
     p = sub.add_parser("api", help="open the tunnel and print the endpoint")
     p.add_argument("--env", action="store_true", help="print export lines: eval \"$(lambdachat api --env)\"")
