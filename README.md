@@ -1,26 +1,84 @@
 # lambda-vllm-chat
 
-Serve a Hugging Face model with vLLM on a Lambda Cloud GPU box and chat with it from your laptop, either in a browser
-(Open WebUI) or in the terminal. Conversations are not saved anywhere. The box terminates itself after an hour with no requests.
+Rent a GPU on Lambda Cloud, run an AI model on it, and talk to it from your own computer: in a browser, in the
+terminal, or through opencode, a coding agent that can run commands and edit files on your computer. The GPU shuts
+itself down after an hour without use.
 
-The default model is [huihui-ai/Huihui-Qwen3.8-27B-abliterated](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated)
-(bf16, ~56 GB), which runs on a single 80 GB GPU (H100 at $3.79/hr when this was written).
+The default model is [huihui-ai/Huihui-Qwen3.8-27B-abliterated](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-27B-abliterated),
+a 27B Qwen model with its refusals removed ("abliterated"), so it answers things other models decline. It runs on one
+80 GB GPU (an H100 at $3.79/hr when this was written).
 
-## Setup (once)
-
-```bash
-git clone https://github.com/Mkrolick/lambda-vllm-chat ~/Code/lambda-vllm-chat
-ln -s ~/Code/lambda-vllm-chat/lambdachat ~/bin/lambdachat     # or anywhere on your PATH
-```
+## Quick start
 
 You need:
 
-- A Lambda Cloud API key, in `~/.config/lambda/api-key` or `$LAMBDA_API_KEY`.
-- An SSH key in `~/.ssh` (`id_ed25519`, `id_ecdsa` or `id_rsa`). If Lambda doesn't have it yet, it is uploaded on the first `up`.
-- Python 3.9+ (standard library only) and [uv](https://docs.astral.sh/uv/). uv installs Open WebUI on the first
-  `lambdachat ui`, and provides prompt_toolkit for the terminal chat's input.
-- For gated models, a Hugging Face token in `$HF_TOKEN` or `~/.cache/huggingface/token`.
-- For `lambdachat opencode`: opencode 2.x (`npm install -g @opencode/cli`).
+- A Mac, or a Linux computer. On Windows, install [WSL](https://learn.microsoft.com/windows/wsl/install) and do
+  everything inside its Ubuntu terminal.
+- A [Lambda Cloud](https://cloud.lambda.com) account with a payment method. You pay Lambda for every minute a GPU
+  is running.
+
+Then, in a terminal (on a Mac: the Terminal app):
+
+1. Get this code. Either clone it:
+
+   ```bash
+   git clone https://github.com/Mkrolick/lambda-vllm-chat.git ~/lambda-vllm-chat
+   ```
+
+   or, on the GitHub page, click **Code → Download ZIP**, unzip it and move the folder to your home folder as
+   `lambda-vllm-chat`. (On a Mac, the first `git` command may offer to install Apple's developer tools; say yes.)
+
+2. Run the installer:
+
+   ```bash
+   cd ~/lambda-vllm-chat
+   ./install.sh
+   ```
+
+   It installs what it needs (uv, Python, opencode), creates an SSH key if you don't have one, and asks for your
+   Lambda API key. Make one at [cloud.lambda.com/api-keys](https://cloud.lambda.com/api-keys) and paste it in. It is
+   checked, then saved in `~/.config/lambda/api-key`, readable only by you. Running the installer again is safe; it
+   also updates opencode.
+
+3. Open a **new** terminal window and start:
+
+   ```bash
+   lambdachat ui          # chat in your browser
+   lambdachat chat        # chat in the terminal
+   lambdachat opencode    # coding agent: runs commands and edits files on THIS computer, without asking
+   ```
+
+   The first one starts a GPU, which takes about 10 minutes. Later commands reuse it while it's running.
+
+4. When you're done:
+
+   ```bash
+   lambdachat down        # shut the GPU down now (otherwise it stops itself after an hour without use)
+   lambdachat status      # what's running and what it has cost so far
+   ```
+
+Good to know:
+
+- **Cost:** billing runs from the first command until `lambdachat down` or the one-hour idle shutdown.
+  `lambdachat status` shows the running total.
+- **opencode acts on your computer:** with this uncensored model it will run whatever commands it decides to, without
+  asking. Start it inside a project folder. `lambdachat opencode --ask` makes it ask before every command and edit.
+- **What's saved:**
+  - The terminal and browser chats aren't saved.
+  - opencode chats are saved on your computer so you can pick up where you left off. They are never uploaded, and
+    they're never put in a git repository.
+
+## Manual setup
+
+`install.sh` does all of this. To do it by hand:
+
+- **The command:** put `lambdachat` on your PATH, e.g. `ln -s ~/lambda-vllm-chat/lambdachat ~/.local/bin/lambdachat`.
+- **Lambda API key:** in `~/.config/lambda/api-key` or `$LAMBDA_API_KEY`.
+- **SSH key:** one in `~/.ssh` (`id_ed25519`, `id_ecdsa` or `id_rsa`). It is uploaded to Lambda on first use.
+- **Python and uv:** Python 3.9+ and [uv](https://docs.astral.sh/uv/). uv installs Open WebUI on the first `lambdachat ui`
+  and provides prompt_toolkit for the terminal chat.
+- **Gated models:** a Hugging Face token in `$HF_TOKEN` or `~/.cache/huggingface/token`.
+- **opencode:** for `lambdachat opencode`, opencode 2.x (`curl -fsSL https://opencode.ai/v2/install | bash`).
 
 ## Use
 
@@ -39,7 +97,7 @@ automatically when no box is running.
 | `lambdachat up` | Launch the cheapest Lambda box with capacity that fits the model, install vLLM, download the model, start serving. If a box is already running, it is re-provisioned in place (safe to re-run). |
 | `lambdachat ui [--no-open]` | Start Open WebUI locally and open it. Chats are temporary and the UI's data is wiped when it stops (see below). |
 | `lambdachat chat` | Terminal chat, kept in memory only. Pasted multi-line text stays one message until you press Enter (Esc then Enter adds a line). `/help` lists commands (system prompt, thinking on/off, sampling, images, retry, undo). |
-| `lambdachat opencode [dir] [--ask]` | [opencode](https://opencode.ai) (coding agent) on your machine, using this model. It runs commands and edits files **without asking**; `--ask` makes it confirm each action. See below. |
+| `lambdachat opencode [dir] [--new] [--ask]` | [opencode](https://opencode.ai) (coding agent) on your machine, using this model. Resumes the folder's last chat (`--new` starts a fresh one). It runs commands and edits files **without asking**; `--ask` makes it confirm each action. See below. |
 | `lambdachat api [--env]` | Open the tunnel and print the OpenAI-compatible endpoint. `eval "$(lambdachat api --env)"` exports `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `LAMBDACHAT_MODEL` (it needs a running box and never launches one). |
 | `lambdachat status` | Model and revision, instance, cost so far, minutes idle, tunnel, UI. |
 | `lambdachat keepalive on\|off` | Pause or resume idle auto-terminate. |
@@ -77,23 +135,28 @@ top_p 0.95, top_k 20 for this model).
 
 ```bash
 cd ~/some/project
-lambdachat opencode            # full-screen opencode; the model runs commands and edits files without asking
-lambdachat opencode --ask      # same, but it asks before every shell command, edit and web request
-lambdachat opencode run "fix the failing test"     # one-shot, prints the result
+lambdachat opencode            # full-screen opencode; resumes this folder's last chat
+lambdachat opencode --new      # start a fresh chat instead
+lambdachat opencode --ask      # asks before every shell command, edit and web request
+lambdachat opencode run "fix the failing test"     # one-shot (also continues the folder's last chat; --new for fresh)
 ```
 
-- The model runs on the Lambda box; opencode, and everything it does (shell commands, file edits), runs **on your
-  machine** as you. Auto-approve is the default (`OPENCODE_AUTO=1` in config.env). Set it to 0 to make `--ask` the
-  default.
-- Thinking mode: pick a variant in `/models` (`#low`, `#medium`, `#nothink`), or `run -m lambda/<model>#nothink`.
-- Its only model is the Lambda one, session sharing is off, and it does not read your `~/.claude` instructions or skills.
-- Nothing is saved: opencode's sessions, prompt history, logs and temp files go to a folder that is deleted when it
-  exits, so `--continue` finds nothing. Commands the agent runs see `XDG_DATA_HOME`, `XDG_STATE_HOME` and `TMPDIR`
-  pointing at that folder.
-- The box's idle timer counts opencode's requests. After 60 minutes with none, the box terminates and the next
-  `lambdachat opencode` starts a new one.
+- **What runs where:** the model runs on the Lambda box. opencode, and everything it does (shell commands, file
+  edits), runs **on your machine** as you.
+- **Approval:** auto-approve is the default (`OPENCODE_AUTO=1` in config.env). Set it to 0 to make `--ask` the default.
+- **Chats:** each folder has its own chat history. `lambdachat opencode` picks up that folder's latest chat. Inside
+  opencode you can also switch to older ones, or use `--session ID`. Chats are stored by opencode in
+  `~/.local/share/opencode` on your computer:
+  - They're outside every git repository. A session adds no files and no commits to the project folder you work in,
+    and opencode's own undo snapshots there have no remote.
+  - Sharing (uploading a chat to opencode.ai) is turned off.
+  - To delete them, remove that folder.
+- **Thinking mode:** pick a variant in `/models` (`#low`, `#medium`, `#nothink`), or `run -m lambda/<model>#nothink`.
+- **What it can see:** its only model is the Lambda one, and it does not read your `~/.claude` instructions or skills.
+- **Idle shutdown:** the box's idle timer counts opencode's requests. After 60 minutes with none, the box terminates.
+  The next `lambdachat opencode` starts a new one and your chats are still there.
 
-## Nothing is saved
+## What is saved
 
 - **Terminal chat**: the conversation exists only in the `lambdachat chat` process. Nothing is written to disk, including
   your input history, and it is gone when you quit.
@@ -102,6 +165,7 @@ lambdachat opencode run "fix the failing test"     # one-shot, prints the result
   This also removes chats you made permanent by turning temporary mode off, uploads and logs. Only the helper models it
   downloads (embeddings, tokenizer) are kept, in `webui-cache`.
 - **The box**: vLLM doesn't log prompts or replies, and the box's disk is erased when it terminates.
+- **opencode**: chats are saved on your computer so they can be resumed (see above). They're never uploaded.
 - **API**: whatever your own scripts record is up to them.
 
 ## Cost and auto-shutdown
