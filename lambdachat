@@ -4,6 +4,8 @@
   lambdachat up                 launch a box (cheapest that fits) and serve the model; reuses a running box
   lambdachat ui                 Open WebUI in the browser (local, http://localhost:13000); runs `up` first if needed
   lambdachat chat               terminal chat (nothing is saved)
+  lambdachat opencode [dir]     opencode (coding agent) using this model; it runs commands and edits files without
+                                asking (pass --ask to approve each action); nothing is saved
   lambdachat api [--env]        open the tunnel and print the OpenAI-compatible endpoint for scripts and eval harnesses
   lambdachat status             box, model, cost so far, idle timer, tunnel and UI
   lambdachat keepalive on|off   pause or resume the box's idle auto-terminate
@@ -1102,6 +1104,102 @@ def cmd_chat(cfg: dict, args) -> None:
     Chat(cfg, state, args).loop()
 
 
+# ---------------------------------------------------------------- opencode
+
+
+def find_opencode() -> str:
+    """The first opencode 2.x on PATH (an old or broken install earlier on PATH is skipped)."""
+    scratch = STATE_DIR / f"opencode-probe-{os.getpid()}"  # opencode logs every start; keep that out of ~/.local
+    env = dict(os.environ, XDG_DATA_HOME=str(scratch), XDG_STATE_HOME=str(scratch))
+    try:
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            exe = Path(d) / "opencode"
+            if os.access(exe, os.X_OK):
+                try:
+                    out = subprocess.run([str(exe), "--version"], capture_output=True, text=True, timeout=30,
+                                         env=env).stdout
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+                if re.search(r"\bv?2\.\d+", out):
+                    return str(exe)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    die("opencode 2.x not found; install it with: npm install -g @opencode/cli")
+
+
+def opencode_config(cfg: dict, state: dict) -> dict:
+    name, provider = state["served_name"], "lambda"
+    kwargs = state.get("template_kwargs") or []
+    variants = []
+    if "enable_thinking" in kwargs:
+        if "reasoning_effort" in kwargs:
+            variants += [{"id": e, "body": {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": e}}}
+                         for e in ("low", "medium")]
+        variants.append({"id": "nothink", "body": {"chat_template_kwargs": {"enable_thinking": False}}})
+    model = {"modelID": name, "name": f"{state['model_repo']} @ {(state.get('revision_sha') or '?')[:7]} (Lambda)",
+             "capabilities": {"tools": True, "input": ["text", "image"], "output": ["text"], "temperature": True,
+                              "reasoning": {"supported": "enable_thinking" in kwargs}},
+             "compatibility": {"reasoningField": "reasoning", "streamUsage": True},
+             "limit": {"context": int(cfg["MAX_MODEL_LEN"]), "output": 32768}}
+    if variants:
+        model["variants"] = variants
+    # Last matching rule wins. Reading and searching stay allowed; anything that changes your machine or reaches
+    # the network asks first. `--auto` approves everything that isn't denied.
+    ask = ("edit", "shell", "execute", "webfetch", "websearch", "external_directory", "subagent")
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "providers": {provider: {
+            "name": "Lambda vLLM (lambdachat)", "package": "@opencode/ai/providers/openai-compatible",
+            "settings": {"baseURL": f"http://127.0.0.1:{cfg['API_PORT']}/v1", "apiKey": "EMPTY"},
+            "models": {name: model}}},
+        "enabled_providers": [provider],
+        "model": f"{provider}/{name}",
+        "small_model": f"{provider}/{name}" + ("#nothink" if variants else ""),
+        "share": "disabled",
+        "permissions": [{"action": a, "resource": "*", "effect": "ask"} for a in ask],
+    }
+
+
+def cmd_opencode(cfg: dict, args) -> None:
+    exe = find_opencode()
+    state = ensure_box(cfg)
+    tunnel_up(state, cfg)
+    if not http_ok(f"http://127.0.0.1:{cfg['API_PORT']}/health", timeout=10):
+        die("the tunnel is up but vLLM is not answering; check `lambdachat logs`")
+    # opencode keeps sessions, prompt history and logs under its XDG data/state dirs. Point those (and its temp files)
+    # at a folder that is deleted when it exits, so no conversation is saved.
+    for old in STATE_DIR.glob("opencode-session-*"):  # left behind by a crash
+        with contextlib.suppress(ValueError, OSError):
+            os.kill(int(old.name.rsplit("-", 1)[1]), 0)
+            continue
+        shutil.rmtree(old, ignore_errors=True)
+    session = STATE_DIR / f"opencode-session-{os.getpid()}"
+    for sub in ("data", "state", "tmp"):
+        (session / sub).mkdir(mode=0o700, parents=True, exist_ok=True)
+    conf = session / "opencode.json"
+    conf.write_text(json.dumps(opencode_config(cfg, state), indent=2))
+    env = dict(os.environ, OPENCODE_CONFIG=str(conf), XDG_DATA_HOME=str(session / "data"),
+               XDG_STATE_HOME=str(session / "state"), TMPDIR=str(session / "tmp"),
+               OPENCODE_DISABLE_CLAUDE_CODE="1",  # don't feed ~/.claude instructions and skills to this model
+               OPENCODE_DISABLE_FREE_MODELS="1", OPENCODE_DISABLE_MODELS_FETCH="1", OPENCODE_DISABLE_AUTOUPDATE="1")
+    rest = list(args.args)
+    ask = "--ask" in rest or cfg.get("OPENCODE_AUTO", "1") == "0"
+    rest = [a for a in rest if a not in ("--ask", "--auto")]
+    flags = ["--standalone"] + ([] if ask else ["--auto"])  # --auto: approve every action that isn't denied
+    cmd = [exe, "run", *flags, *rest[1:]] if rest[:1] == ["run"] else [exe, *flags, *rest]
+    print(f"opencode -> {state['served_name']} on Lambda. "
+          + ("Shell commands, edits and web access ask first." if ask
+             else "Auto-approve is on: it runs commands and edits files without asking (--ask to confirm each).")
+          + " Nothing is saved.", file=sys.stderr)
+    try:
+        code = subprocess.run(cmd, env=env).returncode
+    except KeyboardInterrupt:
+        code = 130
+    finally:
+        shutil.rmtree(session, ignore_errors=True)
+    sys.exit(code)
+
+
 # ---------------------------------------------------------------- main
 
 
@@ -1118,6 +1216,9 @@ def main() -> None:
     p.add_argument("--no-think", action="store_true", help="start with reasoning off")
     p.add_argument("--hide-thinking", action="store_true", help="don't print the reasoning")
     p.set_defaults(fn=cmd_chat)
+    p = sub.add_parser("opencode", help="opencode coding agent using this model (acts without asking; --ask to confirm)")
+    p.add_argument("args", nargs=argparse.REMAINDER, help="passed to opencode, e.g. a directory, --ask, or run MESSAGE")
+    p.set_defaults(fn=cmd_opencode)
     p = sub.add_parser("api", help="open the tunnel and print the endpoint")
     p.add_argument("--env", action="store_true", help="print export lines: eval \"$(lambdachat api --env)\"")
     p.set_defaults(fn=cmd_api)

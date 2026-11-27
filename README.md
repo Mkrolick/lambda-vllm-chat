@@ -20,6 +20,7 @@ You need:
 - Python 3.9+ (standard library only) and [uv](https://docs.astral.sh/uv/). uv installs Open WebUI on the first
   `lambdachat ui`, and provides prompt_toolkit for the terminal chat's input.
 - For gated models, a Hugging Face token in `$HF_TOKEN` or `~/.cache/huggingface/token`.
+- For `lambdachat opencode`: opencode 2.x (`npm install -g @opencode/cli`).
 
 ## Use
 
@@ -38,6 +39,7 @@ automatically when no box is running.
 | `lambdachat up` | Launch the cheapest Lambda box with capacity that fits the model, install vLLM, download the model, start serving. If a box is already running, it is re-provisioned in place (safe to re-run). |
 | `lambdachat ui [--no-open]` | Start Open WebUI locally and open it. Chats are temporary and the UI's data is wiped when it stops (see below). |
 | `lambdachat chat` | Terminal chat, kept in memory only. Pasted multi-line text stays one message until you press Enter (Esc then Enter adds a line). `/help` lists commands (system prompt, thinking on/off, sampling, images, retry, undo). |
+| `lambdachat opencode [dir] [--ask]` | [opencode](https://opencode.ai) (coding agent) on your machine, using this model. It runs commands and edits files **without asking**; `--ask` makes it confirm each action. See below. |
 | `lambdachat api [--env]` | Open the tunnel and print the OpenAI-compatible endpoint. `eval "$(lambdachat api --env)"` exports `OPENAI_BASE_URL`, `OPENAI_API_KEY` and `LAMBDACHAT_MODEL` (it needs a running box and never launches one). |
 | `lambdachat status` | Model and revision, instance, cost so far, minutes idle, tunnel, UI. |
 | `lambdachat keepalive on\|off` | Pause or resume idle auto-terminate. |
@@ -70,6 +72,26 @@ print(r.choices[0].message.content)
 
 If you don't set sampling parameters, the model's own defaults from `generation_config.json` apply (temperature 1.0,
 top_p 0.95, top_k 20 for this model).
+
+## opencode: an agent that acts on your machine
+
+```bash
+cd ~/some/project
+lambdachat opencode            # full-screen opencode; the model runs commands and edits files without asking
+lambdachat opencode --ask      # same, but it asks before every shell command, edit and web request
+lambdachat opencode run "fix the failing test"     # one-shot, prints the result
+```
+
+- The model runs on the Lambda box; opencode, and everything it does (shell commands, file edits), runs **on your
+  machine** as you. Auto-approve is the default (`OPENCODE_AUTO=1` in config.env). Set it to 0 to make `--ask` the
+  default.
+- Thinking mode: pick a variant in `/models` (`#low`, `#medium`, `#nothink`), or `run -m lambda/<model>#nothink`.
+- Its only model is the Lambda one, session sharing is off, and it does not read your `~/.claude` instructions or skills.
+- Nothing is saved: opencode's sessions, prompt history, logs and temp files go to a folder that is deleted when it
+  exits, so `--continue` finds nothing. Commands the agent runs see `XDG_DATA_HOME`, `XDG_STATE_HOME` and `TMPDIR`
+  pointing at that folder.
+- The box's idle timer counts opencode's requests. After 60 minutes with none, the box terminates and the next
+  `lambdachat opencode` starts a new one.
 
 ## Nothing is saved
 
